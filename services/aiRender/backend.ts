@@ -94,6 +94,10 @@ export interface Job {
   workflowId: number;
   status: 'queued' | 'normalizing' | 'preprocessing' | 'generating' | 'postprocessing' | 'completed' | 'failed' | 'cancelled';
   model: string;
+  /** The engine the caller selected. */
+  requestedModel?: string;
+  /** The engine that actually produced the image — differs whenever the selection has no provider. */
+  resolvedModel?: string | null;
   options: any;
   prompt: string;
   estimatedCostUsd: number;
@@ -136,7 +140,7 @@ const MOCK_ARCH_VIDEOS = [
   'https://assets.mixkit.co/videos/preview/mixkit-living-room-with-modern-furniture-and-large-windows-41574-large.mp4'
 ];
 
-async function generateVariant(job: Job, workflow: Workflow, index: number, transport: ImageTransport | null): Promise<{ base64: string; usedFallbackMock: boolean }> {
+async function generateVariant(job: Job, workflow: Workflow, index: number, transport: ImageTransport | null): Promise<{ base64: string; usedFallbackMock: boolean; resolvedModel: string }> {
   // These two providers do not generate an image at all — local_adjustment is applied on the
   // client and gemini_analysis produces a moodboard — so they keep returning the placeholder
   // that the output mapping below replaces with the source image or a moodboard reference.
@@ -145,7 +149,8 @@ async function generateVariant(job: Job, workflow: Workflow, index: number, tran
     await new Promise(r => setTimeout(r, delay));
     return {
       base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', // 1x1 mock PNG
-      usedFallbackMock: true
+      usedFallbackMock: true,
+      resolvedModel: 'none'
     };
   }
 
@@ -261,6 +266,11 @@ async function generateVariant(job: Job, workflow: Workflow, index: number, tran
 
     // 1. Try Gemini 3 multimodal image generator
     let base64 = '';
+    // Records the model that actually produced the bytes. Selecting a non-Gemini engine
+    // (flux-2-pro, stable-diffusion-xl) silently rewrites the target to a Gemini image
+    // model above, so without this the job reports the model you picked rather than the
+    // one that ran.
+    let resolvedModel = '';
     if (hasInputImage) {
       let targetModel = job.model || 'gemini-3.1-flash-image';
       if (!targetModel.startsWith('gemini')) {
@@ -334,6 +344,7 @@ async function generateVariant(job: Job, workflow: Workflow, index: number, tran
               ?.flatMap((candidate: any) => candidate.content?.parts || [])
               .find((part: any) => part.inlineData?.data);
             base64 = imagePart?.inlineData?.data || '';
+            if (base64) resolvedModel = m;
           } else {
             const errText = await res.text();
             console.warn(`[AI-Render] Gemini multimodal image call (${m}) returned status ${res.status}: ${errText}`);
@@ -373,6 +384,7 @@ async function generateVariant(job: Job, workflow: Workflow, index: number, tran
           if (res.ok) {
             const data = await res.json();
             base64 = data?.predictions?.[0]?.bytesBase64Encoded || '';
+            if (base64) resolvedModel = m;
           } else {
             const errText = await res.text();
             console.warn(`[AI-Render] Imagen model ${m} returned status ${res.status}: ${errText}`);
@@ -425,10 +437,11 @@ async function generateVariant(job: Job, workflow: Workflow, index: number, tran
         ?.flatMap((candidate: any) => candidate.content?.parts || [])
         .find((part: any) => part.inlineData?.data);
       base64 = imagePart?.inlineData?.data;
+      if (base64) resolvedModel = targetModel;
     }
-    
+
     if (!base64) throw new Error('No image bytes returned from Vertex AI.');
-    return { base64, usedFallbackMock: false };
+    return { base64, usedFallbackMock: false, resolvedModel };
 
   } catch (liveError: any) {
     console.error(`[AI-Render Job ${job.jobId} Variant ${index + 1}] Live call failed: ${liveError.message}`);
@@ -517,6 +530,19 @@ async function runAsyncJob(jobId: string) {
     );
 
     const usedFallbackMock = results.some(r => r.usedFallbackMock);
+
+    // Report the model that actually ran, not the one the dropdown asked for. FLUX.2 Pro and
+    // Stable Diffusion XL have no provider behind them, so they are rewritten to a Gemini
+    // image model; without this the job would claim to have run the engine you selected.
+    job.requestedModel = job.model;
+    job.resolvedModel = results.find(r => r.resolvedModel && r.resolvedModel !== 'none')?.resolvedModel || null;
+    if (job.resolvedModel && job.resolvedModel !== job.requestedModel) {
+      const line = `Requested model "${job.requestedModel}" is not available; generated with "${job.resolvedModel}".`;
+      console.warn(`[AI-Render Job ${jobId}] ${line}`);
+      job.logs?.push(line);
+    } else if (job.resolvedModel) {
+      job.logs?.push(`Generated with "${job.resolvedModel}".`);
+    }
 
     // 4. Postprocessing
     job.status = 'postprocessing';

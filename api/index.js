@@ -5963,7 +5963,8 @@ async function generateVariant(job, workflow, index, transport) {
     return {
       base64: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=",
       // 1x1 mock PNG
-      usedFallbackMock: true
+      usedFallbackMock: true,
+      resolvedModel: "none"
     };
   }
   if (!transport) {
@@ -6051,6 +6052,7 @@ PROPORTION FIDELITY: Maintain 1:1 true physical proportions of all architectural
 ${canvasSpec}${inpaintingSpec}`;
     const fetch2 = (await import("node-fetch")).default || global.fetch;
     let base64 = "";
+    let resolvedModel = "";
     if (hasInputImage) {
       let targetModel2 = job.model || "gemini-3.1-flash-image";
       if (!targetModel2.startsWith("gemini")) {
@@ -6116,6 +6118,7 @@ ${canvasSpec}${inpaintingSpec}`;
             const data = await res.json();
             const imagePart = data?.candidates?.flatMap((candidate) => candidate.content?.parts || []).find((part) => part.inlineData?.data);
             base64 = imagePart?.inlineData?.data || "";
+            if (base64) resolvedModel = m;
           } else {
             const errText = await res.text();
             console.warn(`[AI-Render] Gemini multimodal image call (${m}) returned status ${res.status}: ${errText}`);
@@ -6151,6 +6154,7 @@ ${canvasSpec}${inpaintingSpec}`;
           if (res.ok) {
             const data = await res.json();
             base64 = data?.predictions?.[0]?.bytesBase64Encoded || "";
+            if (base64) resolvedModel = m;
           } else {
             const errText = await res.text();
             console.warn(`[AI-Render] Imagen model ${m} returned status ${res.status}: ${errText}`);
@@ -6196,9 +6200,10 @@ ${canvasSpec}${inpaintingSpec}`;
       const data = await res.json();
       const imagePart = data?.candidates?.flatMap((candidate) => candidate.content?.parts || []).find((part) => part.inlineData?.data);
       base64 = imagePart?.inlineData?.data;
+      if (base64) resolvedModel = targetModel2;
     }
     if (!base64) throw new Error("No image bytes returned from Vertex AI.");
-    return { base64, usedFallbackMock: false };
+    return { base64, usedFallbackMock: false, resolvedModel };
   } catch (liveError) {
     console.error(`[AI-Render Job ${job.jobId} Variant ${index + 1}] Live call failed: ${liveError.message}`);
     throw liveError;
@@ -6271,6 +6276,15 @@ async function runAsyncJob(jobId) {
       Array.from({ length: variants }).map((_, idx) => generateVariant(job, workflow, idx, transport))
     );
     const usedFallbackMock = results.some((r) => r.usedFallbackMock);
+    job.requestedModel = job.model;
+    job.resolvedModel = results.find((r) => r.resolvedModel && r.resolvedModel !== "none")?.resolvedModel || null;
+    if (job.resolvedModel && job.resolvedModel !== job.requestedModel) {
+      const line = `Requested model "${job.requestedModel}" is not available; generated with "${job.resolvedModel}".`;
+      console.warn(`[AI-Render Job ${jobId}] ${line}`);
+      job.logs?.push(line);
+    } else if (job.resolvedModel) {
+      job.logs?.push(`Generated with "${job.resolvedModel}".`);
+    }
     job.status = "postprocessing";
     console.log(`[AI-Render Job ${jobId}] State: postprocessing`);
     job.logs?.push("Finalizing assets, saving private rendering references.");
