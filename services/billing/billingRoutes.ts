@@ -52,6 +52,10 @@ export const routeBillingApiRequest = async (
         serviceAccount: config.serviceAccountEmail,
         serviceAccountProjectId: config.serviceAccountProjectId,
         configError: config.error,
+        // firebase-admin reaches jose@6 (ESM) through a require() in jwks-rsa, which only
+        // works on Node 22.12+. Reported here because "works locally, 503 in production"
+        // is otherwise a very long afternoon.
+        nodeVersion: typeof process !== 'undefined' ? process.version : null,
       },
     });
     return true;
