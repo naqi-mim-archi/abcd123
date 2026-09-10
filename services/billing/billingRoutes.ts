@@ -4,6 +4,7 @@ import { ensureEntitlement, isBillingConfigured, BILLING_UNCONFIGURED_MESSAGE } 
 import { getStorageUsage, checkStorageAllowance } from './storageUsage';
 import { createCheckoutSession, isStripeConfigured } from './stripeClient';
 import { TOKEN_PACKS, ACTION_PRICES, SIGNUP_GRANT_TOKENS } from './pricing';
+import { getAdminConfigStatus } from '../firebase/adminApp';
 
 interface BillingApiRequest {
   method?: string;
@@ -34,11 +35,24 @@ export const routeBillingApiRequest = async (
   // Static pricing — safe to serve without an account so a signed-out visitor could be
   // shown what things cost.
   if (path === '/api/billing/pricing' && method === 'GET') {
+    // `server` reports whether this deployment is wired up at all. It is deliberately
+    // included on the one public route: without it, a missing or malformed service-account
+    // key is invisible from outside and looks exactly like every user being signed out.
+    // It exposes no secrets — only whether a key parsed, and which account it names.
+    const config = getAdminConfigStatus();
     response.status(200).json({
       packs: TOKEN_PACKS,
       actionPrices: ACTION_PRICES,
       signupGrant: SIGNUP_GRANT_TOKENS,
       paymentsEnabled: isStripeConfigured(),
+      server: {
+        projectId: config.projectId,
+        canVerifySignIn: Boolean(config.projectId),
+        canMeterTokens: config.hasServiceAccount,
+        serviceAccount: config.serviceAccountEmail,
+        serviceAccountProjectId: config.serviceAccountProjectId,
+        configError: config.error,
+      },
     });
     return true;
   }

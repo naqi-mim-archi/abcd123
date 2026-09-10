@@ -16,7 +16,7 @@ import { createKvRevitExportJobStore } from './revitExport/backend/kvRevitExport
 import { routeApsRevitImportApiRequest } from './apsRevitImport/backend/apsRevitImportApiRoutes';
 import { ApsRevitImportBackend } from './apsRevitImport/backend/apsRevitImportBackend';
 import { createKvApsRevitImportJobStore } from './apsRevitImport/backend/kvApsRevitImportJobStore';
-import { verifyApiRequestUser, isAnonymousApiAllowed, API_AUTH_REQUIRED_MESSAGE } from './firebase/adminAuth';
+import { verifyApiRequest, isAnonymousApiAllowed, API_AUTH_REQUIRED_MESSAGE } from './firebase/adminAuth';
 import { routeBillingApiRequest } from './billing/billingRoutes';
 import { decideCharge, resolveRequestId, isPublicApiRoute } from './billing/routeCosts';
 import {
@@ -110,9 +110,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Every route below spends the project's Gemini, Vertex or Autodesk quota, so none of
   // them is safe to serve anonymously. apiAuthInterceptor.ts attaches the caller's Firebase
   // ID token to every same-origin /api/* fetch; without a valid one the answer is 401.
-  const user = await verifyApiRequestUser(req);
+  const auth = await verifyApiRequest(req);
+  const user = auth.user;
   if (!user && !isAnonymousApiAllowed() && !isPublicApiRoute(url, req.method)) {
-    res.status(401).json({ error: API_AUTH_REQUIRED_MESSAGE });
+    // A server that cannot verify anyone's token is broken, not a visitor who forgot to
+    // sign in. Saying 401 for both is what made this undiagnosable from the browser.
+    if (auth.failure === 'server-unconfigured') {
+      res.status(503).json({
+        error: 'Sign-in cannot be verified on the server right now. This is a server configuration problem, not your account.',
+        reason: auth.failure,
+        detail: auth.detail,
+      });
+      return;
+    }
+    res.status(401).json({ error: API_AUTH_REQUIRED_MESSAGE, reason: auth.failure });
     return;
   }
 

@@ -32,13 +32,20 @@ var unwrapQuoted = (raw) => {
   if ((first === "'" || first === '"') && trimmed.endsWith(first)) return trimmed.slice(1, -1);
   return trimmed;
 };
+var serviceAccountParseError = null;
 var readServiceAccount = () => {
   const raw = process.env.FIREBASE_ADMIN_SA_KEY_JSON;
-  if (!raw || !raw.trim()) return null;
+  if (!raw || !raw.trim()) {
+    serviceAccountParseError = "FIREBASE_ADMIN_SA_KEY_JSON is not set.";
+    return null;
+  }
   try {
-    return JSON.parse(unwrapQuoted(raw));
+    const parsed = JSON.parse(unwrapQuoted(raw));
+    serviceAccountParseError = null;
+    return parsed;
   } catch (error) {
-    console.error("FIREBASE_ADMIN_SA_KEY_JSON is not valid JSON; admin features are disabled.", error);
+    serviceAccountParseError = `FIREBASE_ADMIN_SA_KEY_JSON is not valid JSON (${error?.message}). This usually means the \\n escapes inside private_key were converted to real line breaks.`;
+    console.error(serviceAccountParseError);
     return null;
   }
 };
@@ -61,6 +68,9 @@ var getAdminApp = async () => {
     if (bucket) options.storageBucket = bucket;
     return initializeApp(options, APP_NAME);
   })();
+  appPromise.catch(() => {
+    appPromise = null;
+  });
   return appPromise;
 };
 var getAdminFirestore = async () => {

@@ -1603,7 +1603,7 @@ var init_roboflowWallConnector = __esm({
 });
 
 // services/firebase/adminApp.ts
-var APP_NAME, unwrapQuoted, readServiceAccount, resolveProjectId, resolveStorageBucket, hasAdminCredentials, appPromise, getAdminApp, getAdminAuth, getAdminFirestore, getAdminStorageBucket;
+var APP_NAME, unwrapQuoted, serviceAccountParseError, readServiceAccount, resolveProjectId, resolveStorageBucket, hasAdminCredentials, appPromise, getAdminConfigStatus, getAdminApp, getAdminAuth, getAdminFirestore, getAdminStorageBucket;
 var init_adminApp = __esm({
   "services/firebase/adminApp.ts"() {
     APP_NAME = "archai-api";
@@ -1614,13 +1614,20 @@ var init_adminApp = __esm({
       if ((first === "'" || first === '"') && trimmed.endsWith(first)) return trimmed.slice(1, -1);
       return trimmed;
     };
+    serviceAccountParseError = null;
     readServiceAccount = () => {
       const raw = process.env.FIREBASE_ADMIN_SA_KEY_JSON;
-      if (!raw || !raw.trim()) return null;
+      if (!raw || !raw.trim()) {
+        serviceAccountParseError = "FIREBASE_ADMIN_SA_KEY_JSON is not set.";
+        return null;
+      }
       try {
-        return JSON.parse(unwrapQuoted(raw));
+        const parsed = JSON.parse(unwrapQuoted(raw));
+        serviceAccountParseError = null;
+        return parsed;
       } catch (error) {
-        console.error("FIREBASE_ADMIN_SA_KEY_JSON is not valid JSON; admin features are disabled.", error);
+        serviceAccountParseError = `FIREBASE_ADMIN_SA_KEY_JSON is not valid JSON (${error?.message}). This usually means the \\n escapes inside private_key were converted to real line breaks.`;
+        console.error(serviceAccountParseError);
         return null;
       }
     };
@@ -1628,6 +1635,16 @@ var init_adminApp = __esm({
     resolveStorageBucket = () => process.env.FIREBASE_STORAGE_BUCKET || process.env.VITE_FIREBASE_STORAGE_BUCKET || (resolveProjectId() ? `${resolveProjectId()}.appspot.com` : "");
     hasAdminCredentials = () => readServiceAccount() !== null;
     appPromise = null;
+    getAdminConfigStatus = () => {
+      const serviceAccount = readServiceAccount();
+      return {
+        projectId: resolveProjectId() || null,
+        hasServiceAccount: serviceAccount !== null,
+        serviceAccountEmail: serviceAccount?.client_email ?? null,
+        serviceAccountProjectId: serviceAccount?.project_id ?? null,
+        error: serviceAccountParseError
+      };
+    };
     getAdminApp = async () => {
       if (appPromise) return appPromise;
       const projectId = resolveProjectId();
@@ -1643,6 +1660,9 @@ var init_adminApp = __esm({
         if (bucket) options.storageBucket = bucket;
         return initializeApp(options, APP_NAME);
       })();
+      appPromise.catch(() => {
+        appPromise = null;
+      });
       return appPromise;
     };
     getAdminAuth = async () => {
@@ -9887,22 +9907,40 @@ var readBearerToken = (req) => {
   const match = /^Bearer\s+(.+)$/i.exec(value.trim());
   return match ? match[1].trim() : null;
 };
-var verifyApiRequestUser = async (req) => {
+var verifyApiRequest = async (req) => {
   const token = readBearerToken(req);
-  if (!token) return null;
+  if (!token) return { user: null, failure: "no-token" };
+  let auth;
   try {
-    const auth = await getAdminAuth();
-    if (!auth) return null;
+    auth = await getAdminAuth();
+  } catch (error) {
+    const status = getAdminConfigStatus();
+    const detail = status.error || `Firebase admin failed to initialise: ${error?.message}`;
+    console.error("[api-auth] cannot verify tokens:", detail);
+    return { user: null, failure: "server-unconfigured", detail };
+  }
+  if (!auth) {
+    const detail = getApiAuthConfigError() || "Firebase admin is not configured on the server.";
+    console.error("[api-auth] cannot verify tokens:", detail);
+    return { user: null, failure: "server-unconfigured", detail };
+  }
+  try {
     const decoded = await auth.verifyIdToken(token);
     return {
-      uid: decoded.uid,
-      email: decoded.email ?? null,
-      emailVerified: Boolean(decoded.email_verified)
+      user: { uid: decoded.uid, email: decoded.email ?? null, emailVerified: Boolean(decoded.email_verified) },
+      failure: null
     };
-  } catch {
-    return null;
+  } catch (error) {
+    const code = String(error?.code || error?.errorInfo?.code || "");
+    if (code.includes("argument-error") || /project/i.test(String(error?.message || ""))) {
+      console.error("[api-auth] token rejected, likely a server config problem:", error?.message);
+      return { user: null, failure: "server-unconfigured", detail: String(error?.message || code) };
+    }
+    console.warn("[api-auth] token rejected:", code || error?.message);
+    return { user: null, failure: "invalid-token", detail: code || void 0 };
   }
 };
+var getApiAuthConfigError = () => resolveProjectId() ? null : "Firebase is not configured on the server: set FIREBASE_PROJECT_ID (or FIREBASE_ADMIN_SA_KEY_JSON).";
 var isAnonymousApiAllowed = () => {
   const raw = (process.env.ALLOW_ANONYMOUS_API || "").trim().toLowerCase();
   return raw === "1" || raw === "true" || raw === "yes";
@@ -10007,6 +10045,7 @@ var createCheckoutSession = async (request) => {
 
 // services/billing/billingRoutes.ts
 init_pricing();
+init_adminApp();
 var stripQuery = (url) => url.split("?")[0].replace(/\/+$/, "") || "/";
 var routeBillingApiRequest = async (request, response) => {
   const url = String(request.url || "");
@@ -10015,11 +10054,20 @@ var routeBillingApiRequest = async (request, response) => {
   const method = String(request.method || "GET").toUpperCase();
   const uid = request.userId ?? null;
   if (path3 === "/api/billing/pricing" && method === "GET") {
+    const config = getAdminConfigStatus();
     response.status(200).json({
       packs: TOKEN_PACKS,
       actionPrices: ACTION_PRICES,
       signupGrant: SIGNUP_GRANT_TOKENS,
-      paymentsEnabled: isStripeConfigured()
+      paymentsEnabled: isStripeConfigured(),
+      server: {
+        projectId: config.projectId,
+        canVerifySignIn: Boolean(config.projectId),
+        canMeterTokens: config.hasServiceAccount,
+        serviceAccount: config.serviceAccountEmail,
+        serviceAccountProjectId: config.serviceAccountProjectId,
+        configError: config.error
+      }
     });
     return true;
   }
@@ -10177,9 +10225,18 @@ var revitExportBackend;
 var apsRevitImportBackend;
 async function handler(req, res) {
   const url = resolveRequestUrl(req);
-  const user = await verifyApiRequestUser(req);
+  const auth = await verifyApiRequest(req);
+  const user = auth.user;
   if (!user && !isAnonymousApiAllowed() && !isPublicApiRoute(url, req.method)) {
-    res.status(401).json({ error: API_AUTH_REQUIRED_MESSAGE });
+    if (auth.failure === "server-unconfigured") {
+      res.status(503).json({
+        error: "Sign-in cannot be verified on the server right now. This is a server configuration problem, not your account.",
+        reason: auth.failure,
+        detail: auth.detail
+      });
+      return;
+    }
+    res.status(401).json({ error: API_AUTH_REQUIRED_MESSAGE, reason: auth.failure });
     return;
   }
   const request = {

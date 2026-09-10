@@ -16,13 +16,25 @@ const unwrapQuoted = (raw: string): string => {
   return trimmed;
 };
 
+let serviceAccountParseError: string | null = null;
+
 const readServiceAccount = (): Record<string, any> | null => {
   const raw = process.env.FIREBASE_ADMIN_SA_KEY_JSON;
-  if (!raw || !raw.trim()) return null;
+  if (!raw || !raw.trim()) {
+    serviceAccountParseError = 'FIREBASE_ADMIN_SA_KEY_JSON is not set.';
+    return null;
+  }
   try {
-    return JSON.parse(unwrapQuoted(raw));
-  } catch (error) {
-    console.error('FIREBASE_ADMIN_SA_KEY_JSON is not valid JSON; admin features are disabled.', error);
+    const parsed = JSON.parse(unwrapQuoted(raw));
+    serviceAccountParseError = null;
+    return parsed;
+  } catch (error: any) {
+    // By far the most common cause: pasting the key somewhere that turned the \n escapes
+    // inside private_key into real newlines, which is no longer valid JSON.
+    serviceAccountParseError =
+      `FIREBASE_ADMIN_SA_KEY_JSON is not valid JSON (${error?.message}). `
+      + 'This usually means the \\n escapes inside private_key were converted to real line breaks.';
+    console.error(serviceAccountParseError);
     return null;
   }
 };
@@ -48,6 +60,18 @@ export const hasAdminCredentials = (): boolean => readServiceAccount() !== null;
 
 let appPromise: Promise<any> | null = null;
 
+/** What the server can and cannot do, for diagnosing a deployment. Reveals no secrets. */
+export const getAdminConfigStatus = () => {
+  const serviceAccount = readServiceAccount();
+  return {
+    projectId: resolveProjectId() || null,
+    hasServiceAccount: serviceAccount !== null,
+    serviceAccountEmail: serviceAccount?.client_email ?? null,
+    serviceAccountProjectId: serviceAccount?.project_id ?? null,
+    error: serviceAccountParseError,
+  };
+};
+
 export const getAdminApp = async (): Promise<any | null> => {
   if (appPromise) return appPromise;
 
@@ -67,6 +91,12 @@ export const getAdminApp = async (): Promise<any | null> => {
 
     return initializeApp(options, APP_NAME);
   })();
+
+  // A rejected promise left in the cache would make one bad startup permanent for the
+  // lifetime of the warm function, turning a transient failure into a lasting one.
+  appPromise.catch(() => {
+    appPromise = null;
+  });
 
   return appPromise;
 };
