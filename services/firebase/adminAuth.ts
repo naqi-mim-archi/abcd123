@@ -3,7 +3,8 @@
 // middleware) — never in the browser. firebase-admin is a node-only package and must not be
 // imported from any module the client bundle can reach.
 import type { VercelRequest } from '@vercel/node';
-import { getAdminAuth, resolveProjectId, getAdminConfigStatus } from './adminApp';
+import { resolveProjectId } from './adminApp';
+import { verifyFirebaseIdToken } from './verifyIdToken';
 
 export interface ApiUser {
   uid: string;
@@ -47,38 +48,28 @@ export const verifyApiRequest = async (
   const token = readBearerToken(req as any);
   if (!token) return { user: null, failure: 'no-token' };
 
-  let auth: any;
-  try {
-    auth = await getAdminAuth();
-  } catch (error: any) {
-    const status = getAdminConfigStatus();
-    const detail = status.error || `Firebase admin failed to initialise: ${error?.message}`;
-    console.error('[api-auth] cannot verify tokens:', detail);
-    return { user: null, failure: 'server-unconfigured', detail };
-  }
-
-  if (!auth) {
-    const detail = getApiAuthConfigError() || 'Firebase admin is not configured on the server.';
+  const projectId = resolveProjectId();
+  if (!projectId) {
+    const detail = getApiAuthConfigError() || 'Firebase is not configured on the server.';
     console.error('[api-auth] cannot verify tokens:', detail);
     return { user: null, failure: 'server-unconfigured', detail };
   }
 
   try {
-    const decoded = await auth.verifyIdToken(token);
-    return {
-      user: { uid: decoded.uid, email: decoded.email ?? null, emailVerified: Boolean(decoded.email_verified) },
-      failure: null,
-    };
+    return { user: await verifyFirebaseIdToken(token, projectId), failure: null };
   } catch (error: any) {
-    const code = String(error?.code || error?.errorInfo?.code || '');
-    // A project mismatch or a broken credential is a server problem wearing a user's clothes:
-    // the token is fine, this deployment just cannot check it.
-    if (code.includes('argument-error') || /project/i.test(String(error?.message || ''))) {
-      console.error('[api-auth] token rejected, likely a server config problem:', error?.message);
-      return { user: null, failure: 'server-unconfigured', detail: String(error?.message || code) };
+    const message = String(error?.message || error);
+    // Not being able to reach Google's certificates, or being pointed at the wrong project,
+    // is a server problem wearing a user's clothes: the token is fine, this deployment
+    // cannot check it. Saying "please sign in" to those would send someone chasing their
+    // own account for a fault that is not theirs.
+    const isServerFault = /certificate|project id configured|unrecognised key/i.test(message);
+    if (isServerFault) {
+      console.error('[api-auth] cannot verify tokens:', message);
+      return { user: null, failure: 'server-unconfigured', detail: message };
     }
-    console.warn('[api-auth] token rejected:', code || error?.message);
-    return { user: null, failure: 'invalid-token', detail: code || undefined };
+    console.warn('[api-auth] token rejected:', message);
+    return { user: null, failure: 'invalid-token', detail: message };
   }
 };
 

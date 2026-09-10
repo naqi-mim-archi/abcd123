@@ -12,6 +12,7 @@
     "build:api": "node scripts/buildApiFunction.mjs",
     "preview": "vite preview",
     "lint": "tsc --noEmit",
+    "test:id-token": "node scripts/testIdTokenVerification.mjs",
     "test:token-pricing": "node scripts/testTokenPricing.mjs",
     "test:token-ledger": "node scripts/testTokenLedger.mjs",
     "test:ui-density": "node scripts/testUiDensity.mjs",

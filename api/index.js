@@ -1603,7 +1603,7 @@ var init_roboflowWallConnector = __esm({
 });
 
 // services/firebase/adminApp.ts
-var APP_NAME, unwrapQuoted, serviceAccountParseError, readServiceAccount, resolveProjectId, resolveStorageBucket, hasAdminCredentials, appPromise, getAdminConfigStatus, getAdminApp, getAdminAuth, getAdminFirestore, getAdminStorageBucket;
+var APP_NAME, unwrapQuoted, serviceAccountParseError, readServiceAccount, resolveProjectId, resolveStorageBucket, hasAdminCredentials, appPromise, getAdminConfigStatus, getAdminApp, getAdminFirestore, getAdminStorageBucket;
 var init_adminApp = __esm({
   "services/firebase/adminApp.ts"() {
     APP_NAME = "archai-api";
@@ -1664,12 +1664,6 @@ var init_adminApp = __esm({
         appPromise = null;
       });
       return appPromise;
-    };
-    getAdminAuth = async () => {
-      const app = await getAdminApp();
-      if (!app) return null;
-      const { getAuth } = await import("firebase-admin/auth");
-      return getAuth(app);
     };
     getAdminFirestore = async () => {
       if (!hasAdminCredentials()) return null;
@@ -9900,6 +9894,60 @@ var createKvApsRevitImportJobStore = () => createKvJobStore("aps-revit-import");
 
 // services/firebase/adminAuth.ts
 init_adminApp();
+
+// services/firebase/verifyIdToken.ts
+import crypto2 from "node:crypto";
+var CERT_URL = "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com";
+var cachedCerts = null;
+var cachedUntil = 0;
+var fetchCerts = async () => {
+  if (cachedCerts && Date.now() < cachedUntil) return cachedCerts;
+  const response = await fetch(CERT_URL);
+  if (!response.ok) throw new Error(`Could not fetch Google signing certificates (${response.status}).`);
+  const certs = await response.json();
+  const maxAge = /max-age=(\d+)/.exec(response.headers.get("cache-control") || "")?.[1];
+  cachedUntil = Date.now() + (maxAge ? Number(maxAge) * 1e3 : 60 * 60 * 1e3);
+  cachedCerts = certs;
+  return certs;
+};
+var base64UrlDecode = (segment) => Buffer.from(segment.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+var verifyFirebaseIdToken = async (token, projectId) => {
+  if (!projectId) throw new Error("No Firebase project id configured on the server.");
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("Malformed token.");
+  const [rawHeader, rawPayload, rawSignature] = parts;
+  const header = JSON.parse(base64UrlDecode(rawHeader).toString("utf8"));
+  if (header.alg !== "RS256") throw new Error(`Unexpected token algorithm: ${header.alg}`);
+  if (!header.kid) throw new Error("Token has no key id.");
+  const certs = await fetchCerts();
+  const cert = certs[header.kid];
+  const resolvedCert = cert ?? await (async () => {
+    cachedCerts = null;
+    return (await fetchCerts())[header.kid];
+  })();
+  if (!resolvedCert) throw new Error("Token was signed with an unrecognised key.");
+  const publicKey = new crypto2.X509Certificate(resolvedCert).publicKey;
+  const signatureValid = crypto2.createVerify("RSA-SHA256").update(`${rawHeader}.${rawPayload}`).verify(publicKey, base64UrlDecode(rawSignature));
+  if (!signatureValid) throw new Error("Token signature is not valid.");
+  const payload = JSON.parse(base64UrlDecode(rawPayload).toString("utf8"));
+  const now = Math.floor(Date.now() / 1e3);
+  if (payload.aud !== projectId) {
+    throw new Error(`Token was issued for a different Firebase project (${payload.aud}).`);
+  }
+  if (payload.iss !== `https://securetoken.google.com/${projectId}`) {
+    throw new Error(`Unexpected token issuer: ${payload.iss}`);
+  }
+  if (typeof payload.exp !== "number" || payload.exp < now - 60) throw new Error("Token has expired.");
+  if (typeof payload.iat !== "number" || payload.iat > now + 60) throw new Error("Token is not valid yet.");
+  if (!payload.sub || typeof payload.sub !== "string") throw new Error("Token has no subject.");
+  return {
+    uid: payload.sub,
+    email: typeof payload.email === "string" ? payload.email : null,
+    emailVerified: Boolean(payload.email_verified)
+  };
+};
+
+// services/firebase/adminAuth.ts
 var readBearerToken = (req) => {
   const header = req.headers?.authorization || req.headers?.Authorization;
   const value = Array.isArray(header) ? header[0] : header;
@@ -9910,34 +9958,23 @@ var readBearerToken = (req) => {
 var verifyApiRequest = async (req) => {
   const token = readBearerToken(req);
   if (!token) return { user: null, failure: "no-token" };
-  let auth;
-  try {
-    auth = await getAdminAuth();
-  } catch (error) {
-    const status = getAdminConfigStatus();
-    const detail = status.error || `Firebase admin failed to initialise: ${error?.message}`;
-    console.error("[api-auth] cannot verify tokens:", detail);
-    return { user: null, failure: "server-unconfigured", detail };
-  }
-  if (!auth) {
-    const detail = getApiAuthConfigError() || "Firebase admin is not configured on the server.";
+  const projectId = resolveProjectId();
+  if (!projectId) {
+    const detail = getApiAuthConfigError() || "Firebase is not configured on the server.";
     console.error("[api-auth] cannot verify tokens:", detail);
     return { user: null, failure: "server-unconfigured", detail };
   }
   try {
-    const decoded = await auth.verifyIdToken(token);
-    return {
-      user: { uid: decoded.uid, email: decoded.email ?? null, emailVerified: Boolean(decoded.email_verified) },
-      failure: null
-    };
+    return { user: await verifyFirebaseIdToken(token, projectId), failure: null };
   } catch (error) {
-    const code = String(error?.code || error?.errorInfo?.code || "");
-    if (code.includes("argument-error") || /project/i.test(String(error?.message || ""))) {
-      console.error("[api-auth] token rejected, likely a server config problem:", error?.message);
-      return { user: null, failure: "server-unconfigured", detail: String(error?.message || code) };
+    const message = String(error?.message || error);
+    const isServerFault = /certificate|project id configured|unrecognised key/i.test(message);
+    if (isServerFault) {
+      console.error("[api-auth] cannot verify tokens:", message);
+      return { user: null, failure: "server-unconfigured", detail: message };
     }
-    console.warn("[api-auth] token rejected:", code || error?.message);
-    return { user: null, failure: "invalid-token", detail: code || void 0 };
+    console.warn("[api-auth] token rejected:", message);
+    return { user: null, failure: "invalid-token", detail: message };
   }
 };
 var getApiAuthConfigError = () => resolveProjectId() ? null : "Firebase is not configured on the server: set FIREBASE_PROJECT_ID (or FIREBASE_ADMIN_SA_KEY_JSON).";
