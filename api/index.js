@@ -1602,6 +1602,329 @@ var init_roboflowWallConnector = __esm({
   }
 });
 
+// services/firebase/adminApp.ts
+var APP_NAME, unwrapQuoted, readServiceAccount, resolveProjectId, resolveStorageBucket, hasAdminCredentials, appPromise, getAdminApp, getAdminAuth, getAdminFirestore, getAdminStorageBucket;
+var init_adminApp = __esm({
+  "services/firebase/adminApp.ts"() {
+    APP_NAME = "archai-api";
+    unwrapQuoted = (raw) => {
+      const trimmed = raw.trim();
+      if (trimmed.length <= 1 || trimmed.startsWith("{")) return trimmed;
+      const first = trimmed[0];
+      if ((first === "'" || first === '"') && trimmed.endsWith(first)) return trimmed.slice(1, -1);
+      return trimmed;
+    };
+    readServiceAccount = () => {
+      const raw = process.env.FIREBASE_ADMIN_SA_KEY_JSON;
+      if (!raw || !raw.trim()) return null;
+      try {
+        return JSON.parse(unwrapQuoted(raw));
+      } catch (error) {
+        console.error("FIREBASE_ADMIN_SA_KEY_JSON is not valid JSON; admin features are disabled.", error);
+        return null;
+      }
+    };
+    resolveProjectId = () => process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID || process.env.GOOGLE_CLOUD_PROJECT || readServiceAccount()?.project_id || "";
+    resolveStorageBucket = () => process.env.FIREBASE_STORAGE_BUCKET || process.env.VITE_FIREBASE_STORAGE_BUCKET || (resolveProjectId() ? `${resolveProjectId()}.appspot.com` : "");
+    hasAdminCredentials = () => readServiceAccount() !== null;
+    appPromise = null;
+    getAdminApp = async () => {
+      if (appPromise) return appPromise;
+      const projectId = resolveProjectId();
+      const serviceAccount = readServiceAccount();
+      if (!projectId && !serviceAccount) return null;
+      appPromise = (async () => {
+        const { cert, getApps, initializeApp } = await import("firebase-admin/app");
+        const existing = getApps().find((app) => app.name === APP_NAME);
+        if (existing) return existing;
+        const options = { projectId };
+        if (serviceAccount) options.credential = cert(serviceAccount);
+        const bucket = resolveStorageBucket();
+        if (bucket) options.storageBucket = bucket;
+        return initializeApp(options, APP_NAME);
+      })();
+      return appPromise;
+    };
+    getAdminAuth = async () => {
+      const app = await getAdminApp();
+      if (!app) return null;
+      const { getAuth } = await import("firebase-admin/auth");
+      return getAuth(app);
+    };
+    getAdminFirestore = async () => {
+      if (!hasAdminCredentials()) return null;
+      const app = await getAdminApp();
+      if (!app) return null;
+      const { getFirestore } = await import("firebase-admin/firestore");
+      return getFirestore(app);
+    };
+    getAdminStorageBucket = async () => {
+      if (!hasAdminCredentials()) return null;
+      const app = await getAdminApp();
+      if (!app) return null;
+      const { getStorage } = await import("firebase-admin/storage");
+      const bucketName = resolveStorageBucket();
+      return bucketName ? getStorage(app).bucket(bucketName) : getStorage(app).bucket();
+    };
+  }
+});
+
+// services/billing/pricing.ts
+var pricing_exports = {};
+__export(pricing_exports, {
+  ACTION_PRICES: () => ACTION_PRICES,
+  FREE_STORAGE_BYTES: () => FREE_STORAGE_BYTES,
+  INSUFFICIENT_TOKENS_STATUS: () => INSUFFICIENT_TOKENS_STATUS,
+  SIGNUP_GRANT_TOKENS: () => SIGNUP_GRANT_TOKENS,
+  STEP_COSTS: () => STEP_COSTS,
+  TOKEN_PACKS: () => TOKEN_PACKS,
+  formatBytes: () => formatBytes,
+  formatTokens: () => formatTokens,
+  getTokenPack: () => getTokenPack
+});
+var ACTION_PRICES, STEP_COSTS, SIGNUP_GRANT_TOKENS, TOKEN_PACKS, getTokenPack, FREE_STORAGE_BYTES, formatTokens, formatBytes, INSUFFICIENT_TOKENS_STATUS;
+var init_pricing = __esm({
+  "services/billing/pricing.ts"() {
+    ACTION_PRICES = {
+      /** Describe a plan in words: the AI draws it, then digitises it into CAD geometry. */
+      generateAndConvert: 50,
+      /** Upload a floorplan that already exists: digitisation only. */
+      convertOnly: 25,
+      /** One AI render. */
+      render: 50,
+      /** A Revit export or an APS Revit import. */
+      revitJob: 25
+    };
+    STEP_COSTS = {
+      /** Producing the floorplan image with the AI model. */
+      floorplanGeneration: 25,
+      /** Turning a floorplan image into CAD geometry. */
+      floorplanConversion: 25,
+      /** One AI render job (charged once, again on an explicit retry). */
+      aiRender: 50,
+      /** One Revit export or APS Revit import job. */
+      revitJob: 25
+    };
+    SIGNUP_GRANT_TOKENS = 100;
+    TOKEN_PACKS = [
+      { id: "pack-100", tokens: 100, priceUsd: 9.99, priceCents: 999 },
+      { id: "pack-500", tokens: 500, priceUsd: 25.99, priceCents: 2599 },
+      { id: "pack-1000", tokens: 1e3, priceUsd: 49.99, priceCents: 4999 }
+    ];
+    getTokenPack = (packId) => TOKEN_PACKS.find((pack) => pack.id === packId);
+    FREE_STORAGE_BYTES = 5 * 1024 * 1024 * 1024;
+    formatTokens = (count) => `${count.toLocaleString()} token${count === 1 ? "" : "s"}`;
+    formatBytes = (bytes) => {
+      if (bytes < 1024) return `${bytes} B`;
+      const units = ["KB", "MB", "GB", "TB"];
+      let value = bytes / 1024;
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+      }
+      return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+    };
+    INSUFFICIENT_TOKENS_STATUS = 402;
+  }
+});
+
+// services/billing/tokenLedger.ts
+var tokenLedger_exports = {};
+__export(tokenLedger_exports, {
+  BILLING_UNCONFIGURED_MESSAGE: () => BILLING_UNCONFIGURED_MESSAGE,
+  creditTokens: () => creditTokens,
+  ensureEntitlement: () => ensureEntitlement,
+  isBillingConfigured: () => isBillingConfigured,
+  isUnmeteredApiAllowed: () => isUnmeteredApiAllowed,
+  refundTokens: () => refundTokens,
+  setStorageUsage: () => setStorageUsage,
+  spendTokens: () => spendTokens
+});
+var entitlementRef, ledgerRef, DEFAULT_ENTITLEMENT, isBillingConfigured, isUnmeteredApiAllowed, BILLING_UNCONFIGURED_MESSAGE, toEntitlement, ensureEntitlement, spendTokens, refundTokens, creditTokens, setStorageUsage;
+var init_tokenLedger = __esm({
+  "services/billing/tokenLedger.ts"() {
+    init_adminApp();
+    init_pricing();
+    entitlementRef = (db, uid) => db.collection("entitlements").doc(uid);
+    ledgerRef = (db, uid, entryId) => entitlementRef(db, uid).collection("ledger").doc(entryId);
+    DEFAULT_ENTITLEMENT = () => ({
+      tokenBalance: SIGNUP_GRANT_TOKENS,
+      tokensGrantedLifetime: SIGNUP_GRANT_TOKENS,
+      tokensSpentLifetime: 0,
+      storageBytesUsed: 0,
+      storageQuotaBytes: FREE_STORAGE_BYTES
+    });
+    isBillingConfigured = () => hasAdminCredentials();
+    isUnmeteredApiAllowed = () => {
+      const raw = (process.env.ALLOW_UNMETERED_API || "").trim().toLowerCase();
+      return raw === "1" || raw === "true" || raw === "yes";
+    };
+    BILLING_UNCONFIGURED_MESSAGE = "Billing is not configured on the server. Set FIREBASE_ADMIN_SA_KEY_JSON (or ALLOW_UNMETERED_API=1 to run without metering).";
+    toEntitlement = (data) => ({
+      tokenBalance: Number(data?.tokenBalance ?? 0),
+      tokensGrantedLifetime: Number(data?.tokensGrantedLifetime ?? 0),
+      tokensSpentLifetime: Number(data?.tokensSpentLifetime ?? 0),
+      storageBytesUsed: Number(data?.storageBytesUsed ?? 0),
+      storageQuotaBytes: Number(data?.storageQuotaBytes ?? FREE_STORAGE_BYTES),
+      signupGrantedAt: data?.signupGrantedAt ?? null
+    });
+    ensureEntitlement = async (uid) => {
+      const db = await getAdminFirestore();
+      if (!db) throw new Error(BILLING_UNCONFIGURED_MESSAGE);
+      const { FieldValue } = await import("firebase-admin/firestore");
+      const ref = entitlementRef(db, uid);
+      return db.runTransaction(async (tx) => {
+        const snap = await tx.get(ref);
+        if (snap.exists) return toEntitlement(snap.data());
+        const created = { ...DEFAULT_ENTITLEMENT(), signupGrantedAt: FieldValue.serverTimestamp() };
+        tx.set(ref, { ...created, createdAt: FieldValue.serverTimestamp(), updatedAt: FieldValue.serverTimestamp() });
+        tx.set(ledgerRef(db, uid, `signup-grant`), {
+          type: "grant",
+          amount: SIGNUP_GRANT_TOKENS,
+          reason: "signup-grant",
+          balanceAfter: SIGNUP_GRANT_TOKENS,
+          createdAt: FieldValue.serverTimestamp()
+        });
+        return toEntitlement(created);
+      });
+    };
+    spendTokens = async (uid, options) => {
+      const { amount, reason, requestId, detail } = options;
+      const db = await getAdminFirestore();
+      if (!db) throw new Error(BILLING_UNCONFIGURED_MESSAGE);
+      if (amount <= 0) return { ok: true, balance: (await ensureEntitlement(uid)).tokenBalance };
+      const { FieldValue } = await import("firebase-admin/firestore");
+      const ref = entitlementRef(db, uid);
+      const entry = ledgerRef(db, uid, requestId);
+      return db.runTransaction(async (tx) => {
+        const [snap, entrySnap] = await Promise.all([tx.get(ref), tx.get(entry)]);
+        if (entrySnap.exists) {
+          const current = snap.exists ? toEntitlement(snap.data()) : DEFAULT_ENTITLEMENT();
+          return { ok: true, balance: current.tokenBalance, replayed: true };
+        }
+        let existing;
+        if (snap.exists) {
+          existing = toEntitlement(snap.data());
+        } else {
+          existing = { ...DEFAULT_ENTITLEMENT(), signupGrantedAt: FieldValue.serverTimestamp() };
+          tx.set(ref, { ...existing, createdAt: FieldValue.serverTimestamp() });
+          tx.set(ledgerRef(db, uid, "signup-grant"), {
+            type: "grant",
+            amount: SIGNUP_GRANT_TOKENS,
+            reason: "signup-grant",
+            balanceAfter: SIGNUP_GRANT_TOKENS,
+            createdAt: FieldValue.serverTimestamp()
+          });
+        }
+        if (existing.tokenBalance < amount) {
+          return { ok: false, balance: existing.tokenBalance, required: amount };
+        }
+        const balanceAfter = existing.tokenBalance - amount;
+        tx.set(
+          ref,
+          {
+            tokenBalance: balanceAfter,
+            tokensSpentLifetime: existing.tokensSpentLifetime + amount,
+            updatedAt: FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+        tx.set(entry, {
+          type: "spend",
+          amount: -amount,
+          reason,
+          detail: detail ?? null,
+          balanceAfter,
+          createdAt: FieldValue.serverTimestamp()
+        });
+        return { ok: true, balance: balanceAfter };
+      });
+    };
+    refundTokens = async (uid, options) => {
+      const { amount, reason, requestId, detail } = options;
+      if (amount <= 0) return;
+      const db = await getAdminFirestore();
+      if (!db) return;
+      const { FieldValue } = await import("firebase-admin/firestore");
+      const ref = entitlementRef(db, uid);
+      const spendEntry = ledgerRef(db, uid, requestId);
+      const refundEntry = ledgerRef(db, uid, `${requestId}:refund`);
+      await db.runTransaction(async (tx) => {
+        const [snap, spendSnap, refundSnap] = await Promise.all([
+          tx.get(ref),
+          tx.get(spendEntry),
+          tx.get(refundEntry)
+        ]);
+        if (!snap.exists || !spendSnap.exists || refundSnap.exists) return;
+        const charged = Math.abs(Number(spendSnap.data()?.amount ?? 0));
+        if (charged <= 0) return;
+        const existing = toEntitlement(snap.data());
+        const balanceAfter = existing.tokenBalance + charged;
+        tx.set(
+          ref,
+          {
+            tokenBalance: balanceAfter,
+            tokensSpentLifetime: Math.max(0, existing.tokensSpentLifetime - charged),
+            updatedAt: FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+        tx.set(refundEntry, {
+          type: "refund",
+          amount: charged,
+          reason,
+          detail: detail ?? "Refunded: the work did not complete.",
+          balanceAfter,
+          createdAt: FieldValue.serverTimestamp()
+        });
+      });
+    };
+    creditTokens = async (uid, options) => {
+      const { amount, requestId, detail } = options;
+      const db = await getAdminFirestore();
+      if (!db) throw new Error(BILLING_UNCONFIGURED_MESSAGE);
+      const { FieldValue } = await import("firebase-admin/firestore");
+      const ref = entitlementRef(db, uid);
+      const entry = ledgerRef(db, uid, requestId);
+      return db.runTransaction(async (tx) => {
+        const [snap, entrySnap] = await Promise.all([tx.get(ref), tx.get(entry)]);
+        const existing = snap.exists ? toEntitlement(snap.data()) : { ...DEFAULT_ENTITLEMENT(), signupGrantedAt: null };
+        if (entrySnap.exists) return existing.tokenBalance;
+        const balanceAfter = existing.tokenBalance + amount;
+        tx.set(
+          ref,
+          {
+            ...snap.exists ? {} : { ...existing, createdAt: FieldValue.serverTimestamp() },
+            tokenBalance: balanceAfter,
+            tokensGrantedLifetime: existing.tokensGrantedLifetime + amount,
+            updatedAt: FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+        tx.set(entry, {
+          type: "purchase",
+          amount,
+          reason: "purchase",
+          detail,
+          balanceAfter,
+          createdAt: FieldValue.serverTimestamp()
+        });
+        return balanceAfter;
+      });
+    };
+    setStorageUsage = async (uid, usedBytes) => {
+      const db = await getAdminFirestore();
+      if (!db) return;
+      const { FieldValue } = await import("firebase-admin/firestore");
+      await entitlementRef(db, uid).set(
+        { storageBytesUsed: usedBytes, updatedAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+    };
+  }
+});
+
 // services/vercelApiHandler.ts
 import { GoogleGenAI as GoogleGenAI9 } from "@google/genai";
 
@@ -6349,6 +6672,9 @@ async function runAsyncJob(jobId) {
     job.logs?.push(`Job failed: ${job.error}. Raw: ${err.message || err}`);
     job.actualCostUsdEstimate = 0;
     await persist();
+    await refundRenderCharge(job, "failed");
+    job.logs?.push("Tokens for this render have been returned to your balance.");
+    await persist();
   }
 }
 var warmAiRenderVertexAuth = async () => {
@@ -6359,12 +6685,35 @@ var warmAiRenderVertexAuth = async () => {
   }
   return { ready: true, transport: transport.kind, warmupMs: Date.now() - startedAt };
 };
+var refundRenderCharge = async (job, why) => {
+  if (!job.ownerId || !job.chargeRequestId) return;
+  try {
+    const { refundTokens: refundTokens2 } = await Promise.resolve().then(() => (init_tokenLedger(), tokenLedger_exports));
+    const { STEP_COSTS: STEP_COSTS2 } = await Promise.resolve().then(() => (init_pricing(), pricing_exports));
+    await refundTokens2(job.ownerId, {
+      amount: STEP_COSTS2.aiRender,
+      reason: "ai-render",
+      requestId: job.chargeRequestId,
+      detail: `AI render ${why} \u2014 tokens returned.`
+    });
+  } catch (error) {
+    console.error(`[AI-Render Job ${job.jobId}] Token refund failed:`, error);
+  }
+};
 var routeAiRenderApiRequest = async (request, response) => {
   const url = request.url || "";
   if (!url.startsWith("/api/ai-render")) {
     return false;
   }
   console.log(`[AI-Render API] Request: ${request.method} ${url}`);
+  const callerId = request.userId ?? null;
+  const chargeRequestId = request.requestId ?? null;
+  const jobForCaller = async (jobId) => {
+    const job = await getJob(jobId);
+    if (!job) return null;
+    if (job.ownerId && job.ownerId !== callerId) return null;
+    return job;
+  };
   if (url === "/api/ai-render/auth/warm" && request.method === "POST") {
     try {
       const result = await warmAiRenderVertexAuth();
@@ -6446,6 +6795,8 @@ var routeAiRenderApiRequest = async (request, response) => {
     };
     const newJob = {
       jobId,
+      ownerId: callerId,
+      chargeRequestId,
       workflowId: workflow_id,
       status: "queued",
       model: selectedModel,
@@ -6467,7 +6818,7 @@ var routeAiRenderApiRequest = async (request, response) => {
   const statusMatch = url.match(/^\/api\/ai-render\/jobs\/([^/]+)$/);
   if (statusMatch && request.method === "GET") {
     const jobId = statusMatch[1];
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: "Job not found" });
     } else {
@@ -6478,7 +6829,7 @@ var routeAiRenderApiRequest = async (request, response) => {
   const resultMatch = url.match(/^\/api\/ai-render\/jobs\/([^/]+)\/result$/);
   if (resultMatch && request.method === "GET") {
     const jobId = resultMatch[1];
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: "Job not found" });
     } else {
@@ -6489,13 +6840,14 @@ var routeAiRenderApiRequest = async (request, response) => {
   const cancelMatch = url.match(/^\/api\/ai-render\/jobs\/([^/]+)\/cancel$/);
   if (cancelMatch && request.method === "POST") {
     const jobId = cancelMatch[1];
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: "Job not found" });
     } else {
       job.status = "cancelled";
       job.logs?.push("Job cancelled by user.");
       await setJob(jobId, job);
+      await refundRenderCharge(job, "cancelled");
       response.json(job);
     }
     return true;
@@ -6503,12 +6855,13 @@ var routeAiRenderApiRequest = async (request, response) => {
   const retryMatch = url.match(/^\/api\/ai-render\/jobs\/([^/]+)\/retry$/);
   if (retryMatch && request.method === "POST") {
     const jobId = retryMatch[1];
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: "Job not found" });
     } else {
       job.status = "queued";
       job.logs = ["Job retried."];
+      if (chargeRequestId) job.chargeRequestId = chargeRequestId;
       await setJob(jobId, job);
       await scheduleBackgroundJob(jobId);
       response.json(job);
@@ -6519,7 +6872,7 @@ var routeAiRenderApiRequest = async (request, response) => {
   if (rateMatch && request.method === "POST") {
     const jobId = rateMatch[1];
     const { rating } = request.body || {};
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: "Job not found" });
     } else {
@@ -7600,7 +7953,7 @@ var ApsRevitExportBackend = class {
     this.config = config;
     this.store = store;
   }
-  async startExport(manifest) {
+  async startExport(manifest, ownerId = null) {
     const baseConfig = requireConfig(this.config);
     const requestedEngine = manifest.settings.revitEngine;
     const config = configForEngine(baseConfig, requestedEngine);
@@ -7612,6 +7965,7 @@ var ApsRevitExportBackend = class {
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const record = {
       jobId,
+      ownerId,
       status: "queued",
       progressMessage: "Preparing Revit export...",
       warnings: validation.warnings,
@@ -7674,6 +8028,11 @@ var ApsRevitExportBackend = class {
       };
     }).filter((row) => row.year > 0).sort((a, b) => b.year - a.year);
     return { engines: rows };
+  }
+  /** Owner of a job, `undefined` when no such job exists. Used by the routes to gate reads. */
+  async getJobOwner(jobId) {
+    const record = await this.store.get(jobId);
+    return record ? record.ownerId ?? null : void 0;
   }
   async getStatus(jobId) {
     const record = await this.store.get(jobId);
@@ -7740,6 +8099,14 @@ var readJobId = (request) => {
   const match = String(request.url || "").match(/\/api\/exports\/revit\/([^/?#]+)/);
   return match?.[1] && match[1] !== "download" ? decodeURIComponent(match[1]) : void 0;
 };
+var denyForeignJob = async (backend, jobId, request, response) => {
+  const owner = await backend.getJobOwner(jobId);
+  if (owner && owner !== (request.userId ?? null)) {
+    response.status(404).json({ error: `Unknown Revit export job: ${jobId}` });
+    return true;
+  }
+  return false;
+};
 var createRevitExportApiRoutes = (backend = new ApsRevitExportBackend()) => ({
   getRevitExportEngines: async (_request, response) => {
     try {
@@ -7756,7 +8123,7 @@ var createRevitExportApiRoutes = (backend = new ApsRevitExportBackend()) => ({
         response.status(400).json({ error: "Revit export request requires a direct manifest payload." });
         return;
       }
-      const job = await backend.startExport(body.manifest);
+      const job = await backend.startExport(body.manifest, request.userId ?? null);
       response.status(202).json(job);
     } catch (error) {
       response.status(500).json({ error: error instanceof Error ? error.message : String(error) });
@@ -7769,6 +8136,7 @@ var createRevitExportApiRoutes = (backend = new ApsRevitExportBackend()) => ({
         response.status(400).json({ error: "Missing Revit export jobId." });
         return;
       }
+      if (await denyForeignJob(backend, jobId, request, response)) return;
       const status = await backend.getStatus(jobId);
       response.status(200).json(status);
     } catch (error) {
@@ -7782,6 +8150,7 @@ var createRevitExportApiRoutes = (backend = new ApsRevitExportBackend()) => ({
         response.status(400).json({ error: "Missing Revit export jobId." });
         return;
       }
+      if (await denyForeignJob(backend, jobId, request, response)) return;
       const download = await backend.getDownload(jobId);
       response.status(200).json(download);
     } catch (error) {
@@ -9238,7 +9607,7 @@ var ApsRevitImportBackend = class {
     this.config = config;
     this.store = store;
   }
-  async startImport(request) {
+  async startImport(request, ownerId = null) {
     validateStartRequest(request);
     const baseConfig = requireConfig2(this.config);
     const options = { ...getDefaultApsRevitImportOptions(), ...request.options || {} };
@@ -9248,6 +9617,7 @@ var ApsRevitImportBackend = class {
     const safeName = cleanFileName(request.fileName, "source.rvt");
     const record = {
       jobId,
+      ownerId,
       status: "queued",
       progressMessage: "Preparing APS Revit Importer job...",
       warnings: [],
@@ -9323,6 +9693,11 @@ var ApsRevitImportBackend = class {
       };
     }).filter((row) => row.year > 0).sort((a, b) => b.year - a.year);
     return { engines: rows };
+  }
+  /** Owner of a job, `undefined` when no such job exists. Used by the routes to gate reads. */
+  async getJobOwner(jobId) {
+    const record = await this.store.get(jobId);
+    return record ? record.ownerId ?? null : void 0;
   }
   async getStatus(jobId) {
     const record = await this.store.get(jobId);
@@ -9422,6 +9797,14 @@ var readJobId2 = (request) => {
   const match = String(request.url || "").match(/\/api\/imports\/aps-revit\/([^/?#]+)/);
   return match?.[1] && match[1] !== "engines" ? decodeURIComponent(match[1]) : void 0;
 };
+var denyForeignJob2 = async (backend, jobId, request, response) => {
+  const owner = await backend.getJobOwner(jobId);
+  if (owner && owner !== (request.userId ?? null)) {
+    response.status(404).json({ error: `Unknown APS Revit import job: ${jobId}` });
+    return true;
+  }
+  return false;
+};
 var createApsRevitImportApiRoutes = (backend = new ApsRevitImportBackend()) => ({
   getEngines: async (_request, response) => {
     try {
@@ -9434,7 +9817,7 @@ var createApsRevitImportApiRoutes = (backend = new ApsRevitImportBackend()) => (
   postImport: async (request, response) => {
     try {
       const body = request.body;
-      const job = await backend.startImport(body);
+      const job = await backend.startImport(body, request.userId ?? null);
       response.status(202).json(job);
     } catch (error) {
       response.status(500).json({ error: error instanceof Error ? error.message : String(error) });
@@ -9447,6 +9830,7 @@ var createApsRevitImportApiRoutes = (backend = new ApsRevitImportBackend()) => (
         response.status(400).json({ error: "Missing APS Revit import jobId." });
         return;
       }
+      if (await denyForeignJob2(backend, jobId, request, response)) return;
       const status = await backend.getStatus(jobId);
       response.status(200).json(status);
     } catch (error) {
@@ -9460,6 +9844,7 @@ var createApsRevitImportApiRoutes = (backend = new ApsRevitImportBackend()) => (
         response.status(400).json({ error: "Missing APS Revit import jobId." });
         return;
       }
+      if (await denyForeignJob2(backend, jobId, request, response)) return;
       const result = await backend.getResult(jobId);
       response.status(200).json(result);
     } catch (error) {
@@ -9493,7 +9878,267 @@ var routeApsRevitImportApiRequest = async (request, response, backend = new ApsR
 // services/apsRevitImport/backend/kvApsRevitImportJobStore.ts
 var createKvApsRevitImportJobStore = () => createKvJobStore("aps-revit-import");
 
+// services/firebase/adminAuth.ts
+init_adminApp();
+var readBearerToken = (req) => {
+  const header = req.headers?.authorization || req.headers?.Authorization;
+  const value = Array.isArray(header) ? header[0] : header;
+  if (typeof value !== "string") return null;
+  const match = /^Bearer\s+(.+)$/i.exec(value.trim());
+  return match ? match[1].trim() : null;
+};
+var verifyApiRequestUser = async (req) => {
+  const token = readBearerToken(req);
+  if (!token) return null;
+  try {
+    const auth = await getAdminAuth();
+    if (!auth) return null;
+    const decoded = await auth.verifyIdToken(token);
+    return {
+      uid: decoded.uid,
+      email: decoded.email ?? null,
+      emailVerified: Boolean(decoded.email_verified)
+    };
+  } catch {
+    return null;
+  }
+};
+var isAnonymousApiAllowed = () => {
+  const raw = (process.env.ALLOW_ANONYMOUS_API || "").trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "yes";
+};
+var API_AUTH_REQUIRED_MESSAGE = "Sign in to use this feature.";
+
+// services/billing/billingRoutes.ts
+init_tokenLedger();
+
+// services/billing/storageUsage.ts
+init_adminApp();
+init_pricing();
+init_tokenLedger();
+var userPrefix = (uid) => `users/${uid}/`;
+var computeStorageUsage = async (uid) => {
+  const bucket = await getAdminStorageBucket();
+  if (!bucket) return null;
+  const [files] = await bucket.getFiles({ prefix: userPrefix(uid) });
+  return files.reduce((total, file) => total + Number(file.metadata?.size || 0), 0);
+};
+var getStorageUsage = async (uid) => {
+  const entitlement = await ensureEntitlement(uid);
+  const quotaBytes = entitlement.storageQuotaBytes || FREE_STORAGE_BYTES;
+  const usedBytes = await computeStorageUsage(uid);
+  if (usedBytes === null) {
+    return { usedBytes: entitlement.storageBytesUsed, quotaBytes, metered: false };
+  }
+  if (usedBytes !== entitlement.storageBytesUsed) await setStorageUsage(uid, usedBytes);
+  return { usedBytes, quotaBytes, metered: true };
+};
+var checkStorageAllowance = async (uid, additionalBytes) => {
+  const usage = await getStorageUsage(uid);
+  if (!usage.metered) {
+    return { ...usage, allowed: true };
+  }
+  const projected = usage.usedBytes + Math.max(0, additionalBytes);
+  if (projected <= usage.quotaBytes) return { ...usage, allowed: true };
+  return {
+    ...usage,
+    allowed: false,
+    message: "This save would take you past your storage limit. Free up space or add more storage."
+  };
+};
+
+// services/billing/stripeClient.ts
+init_pricing();
+var stripePromise = null;
+var isStripeConfigured = () => Boolean(process.env.STRIPE_SECRET_KEY);
+var getStripe = async () => {
+  if (!isStripeConfigured()) return null;
+  stripePromise ||= (async () => {
+    const { default: Stripe } = await import("stripe");
+    return new Stripe(process.env.STRIPE_SECRET_KEY);
+  })();
+  return stripePromise;
+};
+var resolveAppUrl = (requestOrigin) => {
+  const configured = process.env.APP_BASE_URL || process.env.VITE_APP_BASE_URL;
+  if (configured) return configured.replace(/\/+$/, "");
+  if (requestOrigin) return requestOrigin.replace(/\/+$/, "");
+  const vercelUrl = process.env.VERCEL_PROJECT_PRODUCTION_URL || process.env.VERCEL_URL;
+  return vercelUrl ? `https://${vercelUrl}` : "";
+};
+var createCheckoutSession = async (request) => {
+  const stripe = await getStripe();
+  if (!stripe) throw new Error("Payments are not configured on this deployment.");
+  const pack = getTokenPack(request.packId);
+  if (!pack) throw new Error(`Unknown token pack: ${request.packId}`);
+  const appUrl = resolveAppUrl(request.origin);
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    // The webhook credits the account, not the success redirect — a buyer who closes the
+    // tab before being redirected must still get the tokens they paid for.
+    success_url: `${appUrl}/?checkout=success&pack=${encodeURIComponent(pack.id)}`,
+    cancel_url: `${appUrl}/?checkout=cancelled`,
+    customer_email: request.email || void 0,
+    client_reference_id: request.uid,
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: "usd",
+          unit_amount: pack.priceCents,
+          product_data: {
+            name: `${pack.tokens.toLocaleString()} ArchAI tokens`,
+            description: "Tokens for floorplan generation, conversion and AI rendering."
+          }
+        }
+      }
+    ],
+    // Read back by the webhook. client_reference_id alone is not enough: we need to know
+    // which pack was bought to know how many tokens to credit.
+    metadata: {
+      uid: request.uid,
+      packId: pack.id,
+      tokens: String(pack.tokens)
+    }
+  });
+  if (!session.url) throw new Error("Stripe did not return a checkout URL.");
+  return { url: session.url, sessionId: session.id };
+};
+
+// services/billing/billingRoutes.ts
+init_pricing();
+var stripQuery = (url) => url.split("?")[0].replace(/\/+$/, "") || "/";
+var routeBillingApiRequest = async (request, response) => {
+  const url = String(request.url || "");
+  if (!url.startsWith("/api/billing")) return false;
+  const path3 = stripQuery(url);
+  const method = String(request.method || "GET").toUpperCase();
+  const uid = request.userId ?? null;
+  if (path3 === "/api/billing/pricing" && method === "GET") {
+    response.status(200).json({
+      packs: TOKEN_PACKS,
+      actionPrices: ACTION_PRICES,
+      signupGrant: SIGNUP_GRANT_TOKENS,
+      paymentsEnabled: isStripeConfigured()
+    });
+    return true;
+  }
+  if (!uid) {
+    response.status(401).json({ error: "Sign in to use this feature." });
+    return true;
+  }
+  if (!isBillingConfigured()) {
+    response.status(503).json({ error: BILLING_UNCONFIGURED_MESSAGE });
+    return true;
+  }
+  if (path3 === "/api/billing/account" && method === "GET") {
+    const [entitlement, storage] = await Promise.all([ensureEntitlement(uid), getStorageUsage(uid)]);
+    response.status(200).json({
+      tokenBalance: entitlement.tokenBalance,
+      tokensGrantedLifetime: entitlement.tokensGrantedLifetime,
+      tokensSpentLifetime: entitlement.tokensSpentLifetime,
+      storage,
+      packs: TOKEN_PACKS,
+      actionPrices: ACTION_PRICES,
+      paymentsEnabled: isStripeConfigured()
+    });
+    return true;
+  }
+  if (path3 === "/api/billing/storage/check" && method === "POST") {
+    const additionalBytes = Number(request.body?.additionalBytes ?? 0);
+    if (!Number.isFinite(additionalBytes) || additionalBytes < 0) {
+      response.status(400).json({ error: "additionalBytes must be a non-negative number." });
+      return true;
+    }
+    response.status(200).json(await checkStorageAllowance(uid, additionalBytes));
+    return true;
+  }
+  if (path3 === "/api/billing/checkout" && method === "POST") {
+    if (!isStripeConfigured()) {
+      response.status(503).json({ error: "Payments are not configured on this deployment yet." });
+      return true;
+    }
+    try {
+      const origin = request.headers?.origin || request.headers?.Origin || null;
+      const session = await createCheckoutSession({
+        packId: String(request.body?.packId || ""),
+        uid,
+        email: request.body?.email ?? null,
+        origin: Array.isArray(origin) ? origin[0] : origin
+      });
+      response.status(200).json(session);
+    } catch (error) {
+      response.status(400).json({ error: error?.message || "Could not start checkout." });
+    }
+    return true;
+  }
+  response.status(404).json({ error: "Not found" });
+  return true;
+};
+
+// services/billing/routeCosts.ts
+init_pricing();
+var stripQuery2 = (url) => url.split("?")[0].replace(/\/+$/, "") || "/";
+var GENERATION_PATTERNS = [
+  /^\/api\/text2plan\/image$/,
+  /^\/api\/smart-text2plan\/image$/,
+  /^\/api\/text4[a-j]\/image$/,
+  /^\/api\/auto-plan\/image$/
+];
+var CONVERSION_PATTERNS = [
+  /^\/api\/text4[a-j]\/master-geometry$/,
+  /^\/api\/text4[a-j]\/image-redraw$/,
+  /^\/api\/text4[a-j]\/roboflow\/convert$/,
+  /^\/api\/text4[a-j]\/structured3d\/convert$/
+];
+var resolveRouteCharge = (url, method) => {
+  if (String(method || "GET").toUpperCase() !== "POST") return null;
+  const path3 = stripQuery2(url);
+  if (GENERATION_PATTERNS.some((pattern) => pattern.test(path3))) {
+    return {
+      amount: STEP_COSTS.floorplanGeneration,
+      reason: "floorplan-generation",
+      detail: "Floorplan generation"
+    };
+  }
+  if (CONVERSION_PATTERNS.some((pattern) => pattern.test(path3))) {
+    return {
+      amount: STEP_COSTS.floorplanConversion,
+      reason: "floorplan-conversion",
+      detail: "Floorplan conversion"
+    };
+  }
+  if (path3 === "/api/ai-render/jobs" || /^\/api\/ai-render\/jobs\/[^/]+\/retry$/.test(path3)) {
+    return { amount: STEP_COSTS.aiRender, reason: "ai-render", detail: "AI render" };
+  }
+  if (path3 === "/api/exports/revit") {
+    return { amount: STEP_COSTS.revitJob, reason: "revit-job", detail: "Revit export" };
+  }
+  if (path3 === "/api/imports/aps-revit") {
+    return { amount: STEP_COSTS.revitJob, reason: "revit-job", detail: "Revit import" };
+  }
+  return null;
+};
+var resolveRequestId = (headers) => {
+  const raw = headers?.["x-request-id"] || headers?.["X-Request-Id"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value === "string" && isUsableRequestId(value.trim())) return value.trim();
+  return `req-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+};
+var isUsableRequestId = (value) => /^[A-Za-z0-9_-]{8,120}$/.test(value) && !/^__.*__$/.test(value);
+var decideCharge = (options) => {
+  const charge = resolveRouteCharge(options.url, options.method);
+  if (!charge) return { kind: "free" };
+  if (options.unmeteredAllowed) return { kind: "unmetered", why: "disabled" };
+  if (!options.userId) return { kind: "unmetered", why: "anonymous" };
+  if (!options.billingConfigured) return { kind: "unconfigured" };
+  return { kind: "charge", charge };
+};
+var isPublicApiRoute = (url, method) => String(method || "GET").toUpperCase() === "GET" && stripQuery2(url) === "/api/billing/pricing";
+
 // services/vercelApiHandler.ts
+init_tokenLedger();
+init_pricing();
 var resolveRequestUrl = (req) => {
   const [rawPath, rawQuery = ""] = (req.url || "").split("?");
   const search = new URLSearchParams(rawQuery);
@@ -9532,7 +10177,76 @@ var revitExportBackend;
 var apsRevitImportBackend;
 async function handler(req, res) {
   const url = resolveRequestUrl(req);
-  const request = { method: req.method, url, body: req.body };
+  const user = await verifyApiRequestUser(req);
+  if (!user && !isAnonymousApiAllowed() && !isPublicApiRoute(url, req.method)) {
+    res.status(401).json({ error: API_AUTH_REQUIRED_MESSAGE });
+    return;
+  }
+  const request = {
+    method: req.method,
+    url,
+    body: req.body,
+    userId: user?.uid ?? null,
+    headers: req.headers
+  };
+  if (url.startsWith("/api/billing")) {
+    await routeBillingApiRequest(request, res);
+    return;
+  }
+  const requestId = resolveRequestId(req.headers);
+  request.requestId = requestId;
+  const decision = decideCharge({
+    url,
+    method: req.method,
+    userId: user?.uid ?? null,
+    billingConfigured: isBillingConfigured(),
+    unmeteredAllowed: isUnmeteredApiAllowed()
+  });
+  if (decision.kind === "unconfigured") {
+    res.status(503).json({ error: BILLING_UNCONFIGURED_MESSAGE });
+    return;
+  }
+  let charged = null;
+  if (decision.kind === "charge" && user) {
+    try {
+      const result = await spendTokens(user.uid, {
+        amount: decision.charge.amount,
+        reason: decision.charge.reason,
+        requestId,
+        detail: decision.charge.detail
+      });
+      if (!result.ok) {
+        res.status(INSUFFICIENT_TOKENS_STATUS).json({
+          error: `You need ${decision.charge.amount} tokens for this and have ${result.balance}.`,
+          required: decision.charge.amount,
+          balance: result.balance,
+          reason: decision.charge.reason
+        });
+        return;
+      }
+      charged = decision.charge;
+    } catch (error) {
+      res.status(503).json({ error: error?.message || "Could not check your token balance." });
+      return;
+    }
+  }
+  let finalStatus = 200;
+  if (charged) {
+    const originalStatus = res.status.bind(res);
+    res.status = (code) => {
+      finalStatus = code;
+      return originalStatus(code);
+    };
+  }
+  const refundIfFailed = async () => {
+    if (!charged || !user || finalStatus < 400) return;
+    await refundTokens(user.uid, {
+      amount: charged.amount,
+      reason: charged.reason,
+      requestId,
+      detail: `${charged.detail} failed (${finalStatus}) \u2014 tokens returned.`
+    }).catch((err) => console.error("Token refund failed:", err));
+  };
   try {
     if (url.startsWith("/api/gemini/generateContent")) {
       await dispatchGemini(req, res);
@@ -9609,6 +10323,8 @@ async function handler(req, res) {
     if (!res.writableEnded) {
       res.status(500).json({ error: error?.message || String(error) });
     }
+  } finally {
+    await refundIfFailed();
   }
 }
 export {

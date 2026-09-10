@@ -91,6 +91,18 @@ export function normalizeError(err: any): string {
 
 export interface Job {
   jobId: string;
+  /**
+   * Firebase uid of the caller who created the job. Job ids are opaque, but "hard to guess"
+   * is not access control — every read/cancel/retry/rate below checks this. Null only for
+   * jobs created while ALLOW_ANONYMOUS_API was on (local dev), which stay readable.
+   */
+  ownerId?: string | null;
+  /**
+   * Id of the token charge that paid for this job. A render is charged when the job is
+   * created but only succeeds minutes later, so the refund on failure has to happen out
+   * here rather than in the request that started it.
+   */
+  chargeRequestId?: string | null;
   workflowId: number;
   status: 'queued' | 'normalizing' | 'preprocessing' | 'generating' | 'postprocessing' | 'completed' | 'failed' | 'cancelled';
   model: string;
@@ -619,6 +631,10 @@ async function runAsyncJob(jobId: string) {
     job.logs?.push(`Job failed: ${job.error}. Raw: ${err.message || err}`);
     job.actualCostUsdEstimate = 0;
     await persist();
+    // Nobody should pay for a render that never arrived.
+    await refundRenderCharge(job, 'failed');
+    job.logs?.push('Tokens for this render have been returned to your balance.');
+    await persist();
   }
 }
 
@@ -632,8 +648,29 @@ export const warmAiRenderVertexAuth = async () => {
   return { ready: true, transport: transport.kind, warmupMs: Date.now() - startedAt };
 };
 
+/**
+ * Returns the tokens a failed or cancelled render was charged. Imported lazily so this
+ * module — which the job store also pulls in for its `Job` type — never drags
+ * firebase-admin into a graph that does not need it.
+ */
+const refundRenderCharge = async (job: Job, why: string): Promise<void> => {
+  if (!job.ownerId || !job.chargeRequestId) return;
+  try {
+    const { refundTokens } = await import('../billing/tokenLedger');
+    const { STEP_COSTS } = await import('../billing/pricing');
+    await refundTokens(job.ownerId, {
+      amount: STEP_COSTS.aiRender,
+      reason: 'ai-render',
+      requestId: job.chargeRequestId,
+      detail: `AI render ${why} — tokens returned.`,
+    });
+  } catch (error) {
+    console.error(`[AI-Render Job ${job.jobId}] Token refund failed:`, error);
+  }
+};
+
 export const routeAiRenderApiRequest = async (
-  request: { method?: string; url?: string; body?: any },
+  request: { method?: string; url?: string; body?: any; userId?: string | null; requestId?: string | null },
   response: { status: (code: number) => any; json: (payload: any) => void }
 ): Promise<boolean> => {
   const url = request.url || '';
@@ -642,6 +679,18 @@ export const routeAiRenderApiRequest = async (
   }
 
   console.log(`[AI-Render API] Request: ${request.method} ${url}`);
+
+  const callerId = request.userId ?? null;
+  const chargeRequestId = request.requestId ?? null;
+  // Answers 404 rather than 403 for someone else's job: whether a given job id exists is
+  // itself not the caller's business. A job with no owner predates the auth gate (or was
+  // created in anonymous dev mode) and stays open.
+  const jobForCaller = async (jobId: string): Promise<Job | null> => {
+    const job = await getJob(jobId);
+    if (!job) return null;
+    if (job.ownerId && job.ownerId !== callerId) return null;
+    return job;
+  };
 
   // POST /api/ai-render/auth/warm
   if (url === '/api/ai-render/auth/warm' && request.method === 'POST') {
@@ -739,6 +788,8 @@ export const routeAiRenderApiRequest = async (
 
     const newJob: Job = {
       jobId,
+      ownerId: callerId,
+      chargeRequestId,
       workflowId: workflow_id,
       status: 'queued',
       model: selectedModel,
@@ -765,7 +816,7 @@ export const routeAiRenderApiRequest = async (
   const statusMatch = url.match(/^\/api\/ai-render\/jobs\/([^/]+)$/);
   if (statusMatch && request.method === 'GET') {
     const jobId = statusMatch[1];
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: 'Job not found' });
     } else {
@@ -778,7 +829,7 @@ export const routeAiRenderApiRequest = async (
   const resultMatch = url.match(/^\/api\/ai-render\/jobs\/([^/]+)\/result$/);
   if (resultMatch && request.method === 'GET') {
     const jobId = resultMatch[1];
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: 'Job not found' });
     } else {
@@ -791,13 +842,14 @@ export const routeAiRenderApiRequest = async (
   const cancelMatch = url.match(/^\/api\/ai-render\/jobs\/([^/]+)\/cancel$/);
   if (cancelMatch && request.method === 'POST') {
     const jobId = cancelMatch[1];
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: 'Job not found' });
     } else {
       job.status = 'cancelled';
       job.logs?.push('Job cancelled by user.');
       await setJob(jobId, job);
+      await refundRenderCharge(job, 'cancelled');
       response.json(job);
     }
     return true;
@@ -807,12 +859,15 @@ export const routeAiRenderApiRequest = async (
   const retryMatch = url.match(/^\/api\/ai-render\/jobs\/([^/]+)\/retry$/);
   if (retryMatch && request.method === 'POST') {
     const jobId = retryMatch[1];
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: 'Job not found' });
     } else {
       job.status = 'queued';
       job.logs = ['Job retried.'];
+      // The gate charged this retry under a fresh request id; point the job at it so a
+      // second failure refunds the retry rather than the original attempt.
+      if (chargeRequestId) job.chargeRequestId = chargeRequestId;
       await setJob(jobId, job);
       await scheduleBackgroundJob(jobId);
       response.json(job);
@@ -825,7 +880,7 @@ export const routeAiRenderApiRequest = async (
   if (rateMatch && request.method === 'POST') {
     const jobId = rateMatch[1];
     const { rating } = request.body || {};
-    const job = await getJob(jobId);
+    const job = await jobForCaller(jobId);
     if (!job) {
       response.status(404).json({ error: 'Job not found' });
     } else {

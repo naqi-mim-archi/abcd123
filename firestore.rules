@@ -3,13 +3,74 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    function signedInAs(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    // A profile row is display metadata only. Before this, the whole document was writable
+    // with arbitrary fields — which is exactly how a user would grant themselves a paid
+    // plan once subscription packages land. Anything the server owns lives in
+    // /entitlements instead, which no client can write.
     match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      function validProfile() {
+        return incoming().keys().hasOnly(['email', 'displayName', 'photoURL', 'lastSignInAt'])
+          && (!('email' in incoming()) || incoming().email == null || (incoming().email is string && incoming().email.size() <= 320))
+          && (!('displayName' in incoming()) || incoming().displayName == null || (incoming().displayName is string && incoming().displayName.size() <= 120))
+          && (!('photoURL' in incoming()) || incoming().photoURL == null || (incoming().photoURL is string && incoming().photoURL.size() <= 2048));
+      }
+
+      allow read: if signedInAs(userId);
+      allow create, update: if signedInAs(userId) && validProfile();
+      allow delete: if signedInAs(userId);
+    }
+
+    // The token ledger. Server-owned: `allow write: if false` means no client can change a
+    // balance, and the Admin SDK (services/billing/tokenLedger.ts) bypasses these rules
+    // entirely. A user can read their own balance, which is what makes the live balance in
+    // the header possible without a polling endpoint.
+    match /entitlements/{userId} {
+      allow read: if signedInAs(userId);
+      allow write: if false;
+
+      // Append-only audit trail of every grant, charge, refund and purchase. Readable by
+      // its owner so the tokens panel can show recent activity.
+      match /ledger/{entryId} {
+        allow read: if signedInAs(userId);
+        allow write: if false;
+      }
     }
 
     match /projects/{projectId} {
-      allow read, update, delete: if request.auth != null && request.auth.uid == resource.data.ownerId;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.ownerId;
+      // Firestore caps a document at 1MB. projectsService.ts keeps inline payloads under
+      // 700KB and pushes anything larger to Cloud Storage, so a document arriving here
+      // with a big `data` string is either a bug or an attempt to fill the database.
+      function validProject() {
+        return incoming().keys().hasOnly([
+              'ownerId', 'name', 'mode', 'elementsCount', 'thumbnailUrl',
+              'storageMode', 'data', 'dataUrl', 'createdAt', 'updatedAt'
+            ])
+          && incoming().ownerId is string
+          && incoming().name is string && incoming().name.size() <= 200
+          && incoming().mode is string && incoming().mode.size() <= 60
+          && incoming().elementsCount is int && incoming().elementsCount >= 0
+          && incoming().storageMode in ['inline', 'storage']
+          && (!('data' in incoming()) || (incoming().data is string && incoming().data.size() <= 900000))
+          && (!('dataUrl' in incoming()) || (incoming().dataUrl is string && incoming().dataUrl.size() <= 2048))
+          && (!('thumbnailUrl' in incoming()) || (incoming().thumbnailUrl is string && incoming().thumbnailUrl.size() <= 2048));
+      }
+
+      allow read, delete: if request.auth != null && request.auth.uid == resource.data.ownerId;
+      allow create: if signedInAs(incoming().ownerId) && validProject();
+      // ownerId is immutable: without this an update could hand someone else's account a
+      // document, or take one over.
+      allow update: if request.auth != null
+        && request.auth.uid == resource.data.ownerId
+        && incoming().ownerId == resource.data.ownerId
+        && validProject();
     }
   }
 }

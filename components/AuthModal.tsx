@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import { X, Mail, Lock, User as UserIcon, Loader2, LogIn } from 'lucide-react';
-import { signInWithEmail, signUpWithEmail, signInWithGoogle, getFirebaseAuthErrorMessage } from '../services/firebase/authService';
+import { signInWithEmail, signUpWithEmail, signInWithGoogle, sendPasswordReset, getFirebaseAuthErrorMessage } from '../services/firebase/authService';
 import { isFirebaseConfigured } from '../services/firebase/firebaseConfig';
 
 interface AuthModalProps {
@@ -24,6 +24,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
   const [displayName, setDisplayName] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -32,6 +33,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
   const handleEmailSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+    setNotice(null);
     setIsSubmitting(true);
     try {
       if (mode === 'signup') {
@@ -40,6 +42,26 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
         await signInWithEmail(email, password);
       }
       onClose();
+    } catch (err: any) {
+      setError(getFirebaseAuthErrorMessage(err));
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // Without this, anyone who forgets an email/password is locked out permanently — there
+  // was no recovery path at all before.
+  const handleForgotPassword = async () => {
+    setError(null);
+    setNotice(null);
+    if (!email.trim()) {
+      setError('Enter your email address first, then press Forgot password.');
+      return;
+    }
+    setIsSubmitting(true);
+    try {
+      await sendPasswordReset(email.trim());
+      setNotice('If that address has an account, a reset link is on its way.');
     } catch (err: any) {
       setError(getFirebaseAuthErrorMessage(err));
     } finally {
@@ -138,6 +160,23 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
                 />
               </div>
 
+              {mode === 'signin' && (
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleForgotPassword}
+                    disabled={isSubmitting}
+                    className="text-xs font-bold text-slate-500 hover:text-slate-900 hover:underline disabled:opacity-50"
+                  >
+                    Forgot password?
+                  </button>
+                </div>
+              )}
+
+              {notice && (
+                <p className="text-xs font-medium text-slate-600 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2">{notice}</p>
+              )}
+
               {error && (
                 <p className="text-xs font-medium text-red-600 bg-red-50 border border-red-100 rounded-xl px-3 py-2">{error}</p>
               )}
@@ -155,7 +194,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({ isOpen, onClose }) => {
             <p className="text-center text-xs font-medium text-slate-500">
               {mode === 'signin' ? "Don't have an account?" : 'Already have an account?'}{' '}
               <button
-                onClick={() => { setMode(mode === 'signin' ? 'signup' : 'signin'); setError(null); }}
+                onClick={() => { setMode(mode === 'signin' ? 'signup' : 'signin'); setError(null); setNotice(null); }}
                 className="text-slate-900 font-bold hover:underline"
               >
                 {mode === 'signin' ? 'Sign up' : 'Sign in'}

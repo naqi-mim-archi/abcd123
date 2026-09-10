@@ -2,8 +2,51 @@ rules_version = '2';
 
 service firebase.storage {
   match /b/{bucket}/o {
+
+    function signedInAs(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // This is a Blaze-plan bucket, so every byte written here is billable. Without size and
+    // content-type caps any signed-in user could upload unbounded data under their own
+    // prefix. The limits below are generous next to what the app actually writes:
+    // project.json is only used above the 700KB Firestore threshold, thumbnails are ~20KB,
+    // and render images are single JPEGs.
+
+    // The serialized project, written by projectsService.saveProject when it is too large
+    // to store inline in Firestore.
+    match /users/{userId}/projects/{projectId}/project.json {
+      allow read: if signedInAs(userId);
+      allow write: if signedInAs(userId)
+        && request.resource.size < 20 * 1024 * 1024
+        && request.resource.contentType == 'application/json';
+      allow delete: if signedInAs(userId);
+    }
+
+    match /users/{userId}/projects/{projectId}/thumbnail.jpg {
+      allow read: if signedInAs(userId);
+      allow write: if signedInAs(userId)
+        && request.resource.size < 2 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if signedInAs(userId);
+    }
+
+    // Generated renders and floorplan images attached to a project.
+    match /users/{userId}/projects/{projectId}/images/{imageId} {
+      allow read: if signedInAs(userId);
+      allow write: if signedInAs(userId)
+        && request.resource.size < 25 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+      allow delete: if signedInAs(userId);
+    }
+
+    // Reads and deletes stay open across the whole prefix so account deletion can sweep up
+    // anything an older build left behind. Writes are denied here and granted only by the
+    // specific paths above (rules OR together, so a path with no allow rule is denied) —
+    // the explicit `false` is there to make that intent obvious rather than implied.
     match /users/{userId}/{allPaths=**} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
+      allow read, delete: if signedInAs(userId);
+      allow write: if false;
     }
   }
 }

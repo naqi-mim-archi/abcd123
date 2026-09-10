@@ -25,8 +25,12 @@ import { SiteMapPanel } from './components/SiteMapPanel';
 import { SiteImportWizard } from './components/SiteImportWizard';
 import { AuthModal } from './components/AuthModal';
 import { ProjectsPanel } from './components/ProjectsPanel';
+import { AccountPanel } from './components/AccountPanel';
+import { TokensPanel } from './components/TokensPanel';
+import { watchAccountBalance, EMPTY_BALANCE, type AccountBalance } from './services/billing/balanceClient';
 import { watchAuthState, signOut as firebaseSignOut, completeGoogleRedirectSignIn } from './services/firebase/authService';
 import { isFirebaseConfigured } from './services/firebase/firebaseConfig';
+import { API_AUTH_REQUIRED_EVENT, TOKENS_REQUIRED_EVENT } from './services/firebase/apiAuthInterceptor';
 import type { User as FirebaseUser } from 'firebase/auth';
 import { RevitImportWizard } from './components/RevitImportWizard';
 import { BimImporterWizard } from './components/BimImporterWizard';
@@ -40,7 +44,7 @@ import { RevitExportJobResponse } from './services/revitExport/revitExportTypes'
 import { 
   Upload, Loader2, Save, FileJson, Plus, CheckCircle2, Boxes, Sparkles, Layers as LayersIcon, ChevronDown, ChevronLeft, Globe, Home, Wand2, ScanLine, Hammer,
   GripVertical, GripHorizontal, FileDown, FileUp, Database, DatabaseZap, FileCode2, HardDriveDownload,
-  Menu, FolderOpen, ChevronRight, LogOut, X as CloseIcon, LogIn, Cloud, UserCircle
+  Menu, FolderOpen, ChevronRight, LogOut, X as CloseIcon, LogIn, Cloud, UserCircle, Settings, Coins
 } from 'lucide-react';
 import { WALL_THICKNESS_DEFAULT, WALL_HEIGHT_DEFAULT, DEFAULT_PROJECT_SETTINGS_3D, FT_TO_M, PROCEDURAL_TYPOLOGIES, INTERIOR_ELEMENT_PRESETS, normalizeInteriorElement, registerCustomInteriorPresets } from './constants';
 import { curveLength as analyticCurveLength, getCurvePoint as analyticGetCurvePoint } from './services/geometry/curveGeometry';
@@ -752,7 +756,17 @@ const App: React.FC = () => {
   const mainMenuRef = useRef<HTMLDivElement>(null);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
   const [isProjectsPanelOpen, setIsProjectsPanelOpen] = useState(false);
+  const [isAccountPanelOpen, setIsAccountPanelOpen] = useState(false);
+  const [isTokensPanelOpen, setIsTokensPanelOpen] = useState(false);
+  const [accountBalance, setAccountBalance] = useState<AccountBalance>(EMPTY_BALANCE);
+  // Set when an action was refused for want of tokens, so the panel can say which one.
+  const [tokenShortfall, setTokenShortfall] = useState<{ required: number; balance: number } | null>(null);
+  const [isAccountMenuOpen, setIsAccountMenuOpen] = useState(false);
+  const accountMenuRef = useRef<HTMLDivElement>(null);
   const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
+  // Which saved document the open project belongs to. Without this, every save created a
+  // duplicate instead of updating the project the user already had open.
+  const [currentProjectId, setCurrentProjectId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isFirebaseConfigured) return;
@@ -773,6 +787,70 @@ const App: React.FC = () => {
     window.addEventListener('mousedown', handleClickOutside);
     return () => window.removeEventListener('mousedown', handleClickOutside);
   }, [isImportExportMenuOpen]);
+
+  // Every /api route now requires a signed-in caller. Rather than adding a guard to each
+  // wizard's Generate button, the fetch interceptor tells us when a call was rejected and
+  // we surface the sign-in modal the app already has.
+  useEffect(() => {
+    if (!isFirebaseConfigured) return;
+    const handleAuthRequired = () => setIsAuthModalOpen(true);
+    window.addEventListener(API_AUTH_REQUIRED_EVENT, handleAuthRequired);
+    return () => window.removeEventListener(API_AUTH_REQUIRED_EVENT, handleAuthRequired);
+  }, []);
+
+  // Same idea for running out of tokens (402): open the tokens panel with the shortfall
+  // spelled out, rather than letting the wizard fail with an opaque error.
+  useEffect(() => {
+    if (!isFirebaseConfigured) return;
+    const handleTokensRequired = (event: Event) => {
+      const detail = (event as CustomEvent).detail || {};
+      setTokenShortfall({
+        required: Number(detail.required ?? 0),
+        balance: Number(detail.balance ?? 0),
+      });
+      setIsTokensPanelOpen(true);
+    };
+    window.addEventListener(TOKENS_REQUIRED_EVENT, handleTokensRequired);
+    return () => window.removeEventListener(TOKENS_REQUIRED_EVENT, handleTokensRequired);
+  }, []);
+
+  // Live balance, straight from Firestore. The security rules make entitlements/{uid}
+  // readable by its owner and writable by nobody, so this updates the moment a charge
+  // lands without any polling.
+  useEffect(() => {
+    if (!isFirebaseConfigured || !currentUser) {
+      setAccountBalance(EMPTY_BALANCE);
+      return;
+    }
+    return watchAccountBalance(currentUser.uid, setAccountBalance);
+  }, [currentUser]);
+
+  // Coming back from a successful Stripe Checkout: show the new balance and drop the query
+  // string so a refresh doesn't reopen the panel.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('checkout') !== 'success') return;
+    setIsTokensPanelOpen(true);
+    setTokenShortfall(null);
+    window.history.replaceState({}, '', window.location.pathname);
+  }, []);
+
+  useEffect(() => {
+    if (!isAccountMenuOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (accountMenuRef.current && !accountMenuRef.current.contains(e.target as Node)) {
+        setIsAccountMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', handleClickOutside);
+    return () => window.removeEventListener('mousedown', handleClickOutside);
+  }, [isAccountMenuOpen]);
+
+  // Signing out must not leave the previous user's saved-project id attached to whatever
+  // the next person opens.
+  useEffect(() => {
+    if (!currentUser) setCurrentProjectId(null);
+  }, [currentUser]);
 
   useEffect(() => {
     const handleSnap = (e: Event) => {
@@ -884,6 +962,8 @@ const App: React.FC = () => {
     if (pendingConvert3dId) return setPendingConvert3dId(null);
     if (isPdfExportOpen) return setIsPdfExportOpen(false);
     if (isAuthModalOpen) return setIsAuthModalOpen(false);
+    if (isTokensPanelOpen) return setIsTokensPanelOpen(false);
+    if (isAccountPanelOpen) return setIsAccountPanelOpen(false);
     if (isProjectsPanelOpen) return setIsProjectsPanelOpen(false);
     if (isSiteImportWizardOpen) return setIsSiteImportWizardOpen(false);
     if (isSiteMapPanelOpen) return setIsSiteMapPanelOpen(false);
@@ -3508,15 +3588,82 @@ const App: React.FC = () => {
             onChange={handleImportProjectJson}
           />
 
+          {isFirebaseConfigured && currentUser && (
+            <button
+              onClick={() => { setTokenShortfall(null); setIsTokensPanelOpen(true); }}
+              className="px-2.5 py-1.5 rounded-xl text-slate-600 hover:text-slate-900 hover:bg-slate-100/80 transition-all flex items-center gap-1.5 cursor-pointer"
+              title="Tokens — click to see costs and top up"
+            >
+              <Coins size={15} className="text-slate-500" />
+              <span className="text-xs font-bold tabular-nums">
+                {accountBalance.status === 'ok' ? accountBalance.tokenBalance.toLocaleString() : '—'}
+              </span>
+            </button>
+          )}
+
           {isFirebaseConfigured && (
             currentUser ? (
-              <button
-                onClick={() => firebaseSignOut()}
-                className="p-2 rounded-xl text-slate-600 hover:text-slate-900 hover:bg-slate-100/80 transition-all flex items-center justify-center cursor-pointer"
-                title={`Signed in as ${currentUser.email || currentUser.displayName || 'user'} — click to sign out`}
-              >
-                <UserCircle size={20} />
-              </button>
+              // This used to sign out on a single click of the avatar, with no confirmation
+              // and no other way to reach account settings — one misclick dropped whatever
+              // was unsaved. It now opens a menu instead.
+              <div className="relative" ref={accountMenuRef}>
+                <button
+                  onClick={() => setIsAccountMenuOpen(open => !open)}
+                  className="p-2 rounded-xl text-slate-600 hover:text-slate-900 hover:bg-slate-100/80 transition-all flex items-center justify-center cursor-pointer"
+                  aria-haspopup="menu"
+                  aria-expanded={isAccountMenuOpen}
+                  title={`Signed in as ${currentUser.email || currentUser.displayName || 'user'}`}
+                >
+                  <UserCircle size={20} />
+                </button>
+
+                {isAccountMenuOpen && (
+                  <div
+                    className="absolute right-0 top-full mt-2 w-56 rounded-2xl border border-slate-200/80 bg-white/95 backdrop-blur-xl p-1.5 shadow-2xl shadow-slate-900/12 z-[250] animate-in fade-in zoom-in-95 duration-100 select-none"
+                    role="menu"
+                  >
+                    <div className="px-3 py-2 border-b border-slate-100 mb-1.5">
+                      <p className="text-xs font-bold text-slate-900 truncate">{currentUser.displayName || 'Signed in'}</p>
+                      <p className="text-[10px] font-medium text-slate-400 truncate">{currentUser.email}</p>
+                    </div>
+                    <button
+                      onClick={() => { setIsAccountMenuOpen(false); setIsProjectsPanelOpen(true); }}
+                      className="w-full rounded-xl px-3 py-2 text-left text-xs font-medium text-slate-700 transition-colors hover:bg-slate-100/90 hover:text-slate-900 flex items-center gap-2.5 cursor-pointer"
+                      role="menuitem"
+                    >
+                      <Cloud size={15} className="text-slate-500" />
+                      <span className="flex-1">My Projects</span>
+                    </button>
+                    <button
+                      onClick={() => { setIsAccountMenuOpen(false); setTokenShortfall(null); setIsTokensPanelOpen(true); }}
+                      className="w-full rounded-xl px-3 py-2 text-left text-xs font-medium text-slate-700 transition-colors hover:bg-slate-100/90 hover:text-slate-900 flex items-center gap-2.5 cursor-pointer"
+                      role="menuitem"
+                    >
+                      <Coins size={15} className="text-slate-500" />
+                      <span className="flex-1">Tokens</span>
+                      <span className="text-[10px] font-bold text-slate-400 tabular-nums">
+                        {accountBalance.status === 'ok' ? accountBalance.tokenBalance.toLocaleString() : '—'}
+                      </span>
+                    </button>
+                    <button
+                      onClick={() => { setIsAccountMenuOpen(false); setIsAccountPanelOpen(true); }}
+                      className="w-full rounded-xl px-3 py-2 text-left text-xs font-medium text-slate-700 transition-colors hover:bg-slate-100/90 hover:text-slate-900 flex items-center gap-2.5 cursor-pointer"
+                      role="menuitem"
+                    >
+                      <Settings size={15} className="text-slate-500" />
+                      <span className="flex-1">Account settings</span>
+                    </button>
+                    <button
+                      onClick={() => { setIsAccountMenuOpen(false); firebaseSignOut(); }}
+                      className="w-full rounded-xl px-3 py-2 text-left text-xs font-medium text-slate-700 transition-colors hover:bg-slate-100/90 hover:text-slate-900 flex items-center gap-2.5 cursor-pointer"
+                      role="menuitem"
+                    >
+                      <LogOut size={15} className="text-slate-500" />
+                      <span className="flex-1">Sign out</span>
+                    </button>
+                  </div>
+                )}
+              </div>
             ) : (
               <button
                 onClick={() => setIsAuthModalOpen(true)}
@@ -4321,7 +4468,31 @@ const App: React.FC = () => {
           onClose={() => setIsProjectsPanelOpen(false)}
           userId={currentUser.uid}
           currentProject={project}
-          onLoadProject={(loadedProject) => setProject(loadedProject)}
+          currentProjectId={currentProjectId}
+          onLoadProject={(loadedProject, projectId) => {
+            setProject(loadedProject);
+            setCurrentProjectId(projectId);
+          }}
+          onProjectSaved={(projectId, name) => {
+            setCurrentProjectId(projectId);
+            setProject(prev => (prev && prev.name !== name ? { ...prev, name } : prev));
+          }}
+        />
+      )}
+      {currentUser && (
+        <AccountPanel
+          isOpen={isAccountPanelOpen}
+          onClose={() => setIsAccountPanelOpen(false)}
+          user={currentUser}
+        />
+      )}
+      {currentUser && (
+        <TokensPanel
+          isOpen={isTokensPanelOpen}
+          onClose={() => { setIsTokensPanelOpen(false); setTokenShortfall(null); }}
+          user={currentUser}
+          balance={accountBalance}
+          shortfall={tokenShortfall}
         />
       )}
       <PdfExportDialog

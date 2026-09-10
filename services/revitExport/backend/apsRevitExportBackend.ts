@@ -21,6 +21,12 @@ export interface ApsRevitExportConfig {
 }
 
 export interface RevitExportJobRecord extends RevitExportJobResponse {
+  /**
+   * Firebase uid of the caller who started the export. Job ids are unguessable, but that
+   * is not access control — the routes reject a mismatch. Null for jobs started while
+   * ALLOW_ANONYMOUS_API was on (local dev), which stay open.
+   */
+  ownerId?: string | null;
   createdAt: string;
   updatedAt: string;
   manifest?: RevitExportManifest;
@@ -286,7 +292,7 @@ export class ApsRevitExportBackend {
     private readonly store: RevitExportJobStore = new InMemoryRevitExportJobStore(),
   ) {}
 
-  async startExport(manifest: RevitExportManifest): Promise<RevitExportJobResponse> {
+  async startExport(manifest: RevitExportManifest, ownerId: string | null = null): Promise<RevitExportJobResponse> {
     const baseConfig = requireConfig(this.config);
     const requestedEngine = manifest.settings.revitEngine;
     const config = configForEngine(baseConfig, requestedEngine);
@@ -299,6 +305,7 @@ export class ApsRevitExportBackend {
     const now = new Date().toISOString();
     const record: RevitExportJobRecord = {
       jobId,
+      ownerId,
       status: 'queued',
       progressMessage: 'Preparing Revit export...',
       warnings: validation.warnings,
@@ -368,6 +375,12 @@ export class ApsRevitExportBackend {
       .filter(row => row.year > 0)
       .sort((a, b) => b.year - a.year);
     return { engines: rows };
+  }
+
+  /** Owner of a job, `undefined` when no such job exists. Used by the routes to gate reads. */
+  async getJobOwner(jobId: string): Promise<string | null | undefined> {
+    const record = await this.store.get(jobId);
+    return record ? record.ownerId ?? null : undefined;
   }
 
   async getStatus(jobId: string): Promise<RevitExportJobResponse> {

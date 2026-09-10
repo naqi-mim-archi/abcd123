@@ -16,6 +16,17 @@ import { createKvRevitExportJobStore } from './revitExport/backend/kvRevitExport
 import { routeApsRevitImportApiRequest } from './apsRevitImport/backend/apsRevitImportApiRoutes';
 import { ApsRevitImportBackend } from './apsRevitImport/backend/apsRevitImportBackend';
 import { createKvApsRevitImportJobStore } from './apsRevitImport/backend/kvApsRevitImportJobStore';
+import { verifyApiRequestUser, isAnonymousApiAllowed, API_AUTH_REQUIRED_MESSAGE } from './firebase/adminAuth';
+import { routeBillingApiRequest } from './billing/billingRoutes';
+import { decideCharge, resolveRequestId, isPublicApiRoute } from './billing/routeCosts';
+import {
+  spendTokens,
+  refundTokens,
+  isBillingConfigured,
+  isUnmeteredApiAllowed,
+  BILLING_UNCONFIGURED_MESSAGE,
+} from './billing/tokenLedger';
+import { INSUFFICIENT_TOKENS_STATUS } from './billing/pricing';
 
 // A single catch-all Vercel function serving every API route. Vercel's Hobby plan caps
 // deployments at 12 serverless functions — one file per route family would have meant 13.
@@ -31,7 +42,15 @@ import { createKvApsRevitImportJobStore } from './apsRevitImport/backend/kvApsRe
 // a single self-contained api/index.js — the only file Vercel ever sees — leaving nothing but
 // bare npm specifiers for the runtime to resolve. Edit this file, never api/index.js, and run
 // `npm run build:api` (npm run build does it too) so the committed bundle stays in step.
-type ApiRequestShape = { method?: string; url?: string; body?: any };
+type ApiRequestShape = {
+  method?: string;
+  url?: string;
+  body?: any;
+  userId?: string | null;
+  headers?: Record<string, any>;
+  /** Id of the token charge for this request, so async work can refund against it. */
+  requestId?: string | null;
+};
 
 // vercel.json rewrites every /api/* request here as `/api?__path=/api/<original path>`,
 // because a function in the api/ directory only serves its own path — nothing else matched
@@ -87,7 +106,92 @@ let apsRevitImportBackend: ApsRevitImportBackend | undefined;
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const url = resolveRequestUrl(req);
-  const request: ApiRequestShape = { method: req.method, url, body: req.body };
+
+  // Every route below spends the project's Gemini, Vertex or Autodesk quota, so none of
+  // them is safe to serve anonymously. apiAuthInterceptor.ts attaches the caller's Firebase
+  // ID token to every same-origin /api/* fetch; without a valid one the answer is 401.
+  const user = await verifyApiRequestUser(req);
+  if (!user && !isAnonymousApiAllowed() && !isPublicApiRoute(url, req.method)) {
+    res.status(401).json({ error: API_AUTH_REQUIRED_MESSAGE });
+    return;
+  }
+
+  const request: ApiRequestShape = {
+    method: req.method,
+    url,
+    body: req.body,
+    userId: user?.uid ?? null,
+    headers: req.headers as Record<string, any>,
+  };
+
+  if (url.startsWith('/api/billing')) {
+    await routeBillingApiRequest(request, res as any);
+    return;
+  }
+
+  // Charge before the work happens, so a user cannot start ten generations at once on a
+  // balance that only covers one. The debit is a Firestore transaction keyed by the
+  // request id, so a retry of the same request re-uses the original charge.
+  const requestId = resolveRequestId(req.headers as Record<string, any>);
+  request.requestId = requestId;
+
+  const decision = decideCharge({
+    url,
+    method: req.method,
+    userId: user?.uid ?? null,
+    billingConfigured: isBillingConfigured(),
+    unmeteredAllowed: isUnmeteredApiAllowed(),
+  });
+
+  if (decision.kind === 'unconfigured') {
+    res.status(503).json({ error: BILLING_UNCONFIGURED_MESSAGE });
+    return;
+  }
+
+  let charged: { amount: number; reason: any; detail: string } | null = null;
+  if (decision.kind === 'charge' && user) {
+    try {
+      const result = await spendTokens(user.uid, {
+        amount: decision.charge.amount,
+        reason: decision.charge.reason,
+        requestId,
+        detail: decision.charge.detail,
+      });
+      if (!result.ok) {
+        res.status(INSUFFICIENT_TOKENS_STATUS).json({
+          error: `You need ${decision.charge.amount} tokens for this and have ${result.balance}.`,
+          required: decision.charge.amount,
+          balance: result.balance,
+          reason: decision.charge.reason,
+        });
+        return;
+      }
+      charged = decision.charge;
+    } catch (error: any) {
+      res.status(503).json({ error: error?.message || 'Could not check your token balance.' });
+      return;
+    }
+  }
+
+  // Watch the status the route ends up sending, so work that failed can be paid back.
+  let finalStatus = 200;
+  if (charged) {
+    const originalStatus = res.status.bind(res);
+    (res as any).status = (code: number) => {
+      finalStatus = code;
+      return originalStatus(code);
+    };
+  }
+
+  const refundIfFailed = async () => {
+    if (!charged || !user || finalStatus < 400) return;
+    await refundTokens(user.uid, {
+      amount: charged.amount,
+      reason: charged.reason,
+      requestId,
+      detail: `${charged.detail} failed (${finalStatus}) — tokens returned.`,
+    }).catch(err => console.error('Token refund failed:', err));
+  };
 
   try {
     if (url.startsWith('/api/gemini/generateContent')) {
@@ -167,5 +271,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     if (!res.writableEnded) {
       res.status(500).json({ error: error?.message || String(error) });
     }
+  } finally {
+    await refundIfFailed();
   }
 }

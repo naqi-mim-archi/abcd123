@@ -7,6 +7,8 @@ import {
   signOut as firebaseSignOut,
   onAuthStateChanged,
   updateProfile,
+  sendPasswordResetEmail,
+  sendEmailVerification,
   GoogleAuthProvider,
   type User,
 } from 'firebase/auth';
@@ -46,6 +48,9 @@ export const signUpWithEmail = async (email: string, password: string, displayNa
     await updateProfile(credential.user, { displayName });
   }
   await upsertUserProfile(credential.user);
+  // Nothing is gated on verification yet — this just gets the address confirmed early so
+  // password recovery works when someone needs it a year from now.
+  sendEmailVerification(credential.user).catch(err => console.warn('Verification email failed to send:', err));
   return credential.user;
 };
 
@@ -93,6 +98,26 @@ export const watchAuthState = (callback: (user: User | null) => void): (() => vo
   return onAuthStateChanged(auth, callback);
 };
 
+/** Sends the reset link. Deliberately does not reveal whether the address has an account. */
+export const sendPasswordReset = async (email: string): Promise<void> => {
+  await sendPasswordResetEmail(getFirebaseAuth(), email);
+};
+
+export const resendEmailVerification = async (): Promise<void> => {
+  const user = getFirebaseAuth().currentUser;
+  if (!user) throw new Error('You are not signed in.');
+  if (user.emailVerified) return;
+  await sendEmailVerification(user);
+};
+
+export const updateDisplayName = async (displayName: string): Promise<void> => {
+  const user = getFirebaseAuth().currentUser;
+  if (!user) throw new Error('You are not signed in.');
+  const trimmed = displayName.trim();
+  await updateProfile(user, { displayName: trimmed || null });
+  await upsertUserProfile(user);
+};
+
 export const getFirebaseAuthErrorMessage = (error: any): string => {
   const code = String(error?.code || '');
   switch (code) {
@@ -117,6 +142,12 @@ export const getFirebaseAuthErrorMessage = (error: any): string => {
       return 'Network error — check your connection and try again.';
     case 'auth/too-many-requests':
       return 'Too many attempts — please wait a moment and try again.';
+    case 'auth/missing-email':
+      return 'Enter your email address first.';
+    case 'auth/requires-recent-login':
+      return 'For security, sign in again before making this change.';
+    case 'auth/user-mismatch':
+      return 'That account does not match the one you are signed in as.';
     default:
       return error?.message || 'Something went wrong. Please try again.';
   }

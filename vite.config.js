@@ -130,6 +130,39 @@ export default defineConfig(({ mode }) => {
           // On-demand lazy loading: Backend modules load instantly when an API request is made
         });
         server.middlewares.use(async (request, response, next) => {
+          // In production this is its own serverless function (api/stripe-webhook.js), which
+          // vite knows nothing about — so without this branch a local `stripe listen` would
+          // forward to the SPA, get a 200 back with index.html, and report every delivery as
+          // delivered while nothing was ever credited. Handled first and separately because
+          // it must skip the auth gate (Stripe has no Firebase token) and needs the raw
+          // request bytes, which Stripe signs.
+          if (request.url?.startsWith('/api/stripe-webhook')) {
+            if (request.method !== 'POST') {
+              response.statusCode = 405;
+              response.setHeader('Content-Type', 'application/json');
+              response.end(JSON.stringify({ error: 'Method not allowed' }));
+              return;
+            }
+            try {
+              const rawBody = await new Promise((resolve, reject) => {
+                const chunks = [];
+                request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+                request.on('end', () => resolve(Buffer.concat(chunks)));
+                request.on('error', reject);
+              });
+              const { handleStripeWebhook } = await server.ssrLoadModule('/services/billing/stripeWebhook.ts');
+              const result = await handleStripeWebhook(rawBody, request.headers['stripe-signature']);
+              response.statusCode = result.status;
+              response.setHeader('Content-Type', 'application/json');
+              response.end(JSON.stringify(result.body));
+            } catch (error) {
+              response.statusCode = 500;
+              response.setHeader('Content-Type', 'application/json');
+              response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+            }
+            return;
+          }
+
           const isRevitExportRequest = request.url?.startsWith('/api/exports/revit');
           const isApsRevitImportRequest = request.url?.startsWith('/api/imports/aps-revit');
           const isAutoPlanRequest = request.url?.startsWith('/api/auto-plan');
@@ -143,15 +176,40 @@ export default defineConfig(({ mode }) => {
           const isSmartText2PlanRequest = request.url?.startsWith('/api/smart-text2plan');
           const isAiRenderRequest = request.url?.startsWith('/api/ai-render');
           const isGeminiProxyRequest = request.url?.startsWith('/api/gemini/generateContent');
-          if (!isRevitExportRequest && !isApsRevitImportRequest && !isAutoPlanRequest && !isText2PlanRequest && !isText4dRequest && !isText4eRequest && !isText4fRequest && !isText4gRequest && !isText4hRequest && !isText4jRequest && !isSmartText2PlanRequest && !isAiRenderRequest && !isGeminiProxyRequest) {
+          const isBillingRequest = request.url?.startsWith('/api/billing');
+          if (!isRevitExportRequest && !isApsRevitImportRequest && !isAutoPlanRequest && !isText2PlanRequest && !isText4dRequest && !isText4eRequest && !isText4fRequest && !isText4gRequest && !isText4hRequest && !isText4jRequest && !isSmartText2PlanRequest && !isAiRenderRequest && !isGeminiProxyRequest && !isBillingRequest) {
             next();
             return;
           }
 
+          // Declared out here because the `finally` at the bottom needs them to decide
+          // whether a charge has to be paid back.
+          let apiUserId = null;
+          let finalStatus = 200;
+          let charged = null;
+          let ledger = null;
+          let requestId = null;
+
           try {
+            // Same gate the deployed function applies (services/vercelApiHandler.ts): every
+            // route below spends real Gemini/Vertex/APS quota. Set ALLOW_ANONYMOUS_API=1 to
+            // browse locally without signing in — production must never set it.
+            const { verifyApiRequestUser, isAnonymousApiAllowed, API_AUTH_REQUIRED_MESSAGE } =
+              await server.ssrLoadModule('/services/firebase/adminAuth.ts');
+            const { isPublicApiRoute } = await server.ssrLoadModule('/services/billing/routeCosts.ts');
+            const apiUser = await verifyApiRequestUser(request);
+            if (!apiUser && !isAnonymousApiAllowed() && !isPublicApiRoute(request.url, request.method)) {
+              response.statusCode = 401;
+              response.setHeader('Content-Type', 'application/json');
+              response.end(JSON.stringify({ error: API_AUTH_REQUIRED_MESSAGE }));
+              return;
+            }
+            apiUserId = apiUser?.uid ?? null;
+
             const body = request.method === 'POST' ? await readJsonBody(request) : undefined;
             const apiResponse = {
               status(code) {
+                finalStatus = code;
                 response.statusCode = code;
                 return apiResponse;
               },
@@ -160,6 +218,58 @@ export default defineConfig(({ mode }) => {
                 response.end(JSON.stringify(payload));
               },
             };
+
+            if (isBillingRequest) {
+              const { routeBillingApiRequest } = await server.ssrLoadModule('/services/billing/billingRoutes.ts');
+              await routeBillingApiRequest({
+                method: request.method,
+                url: request.url,
+                userId: apiUserId,
+                headers: request.headers,
+                body,
+              }, apiResponse);
+              return;
+            }
+
+            // Same metering the deployed function applies, via the same decision function
+            // so the two cannot drift. See services/billing/routeCosts.ts.
+            const { decideCharge, resolveRequestId } = await server.ssrLoadModule('/services/billing/routeCosts.ts');
+            ledger = await server.ssrLoadModule('/services/billing/tokenLedger.ts');
+            const { INSUFFICIENT_TOKENS_STATUS } = await server.ssrLoadModule('/services/billing/pricing.ts');
+            requestId = resolveRequestId(request.headers);
+
+            const decision = decideCharge({
+              url: request.url,
+              method: request.method,
+              userId: apiUserId,
+              billingConfigured: ledger.isBillingConfigured(),
+              unmeteredAllowed: ledger.isUnmeteredApiAllowed(),
+            });
+
+            if (decision.kind === 'unconfigured') {
+              apiResponse.status(503).json({ error: ledger.BILLING_UNCONFIGURED_MESSAGE });
+              return;
+            }
+
+            if (decision.kind === 'charge') {
+              const spend = await ledger.spendTokens(apiUserId, {
+                amount: decision.charge.amount,
+                reason: decision.charge.reason,
+                requestId,
+                detail: decision.charge.detail,
+              });
+              if (!spend.ok) {
+                apiResponse.status(INSUFFICIENT_TOKENS_STATUS).json({
+                  error: `You need ${decision.charge.amount} tokens for this and have ${spend.balance}.`,
+                  required: decision.charge.amount,
+                  balance: spend.balance,
+                  reason: decision.charge.reason,
+                });
+                return;
+              }
+              charged = decision.charge;
+            }
+
             let handled = false;
             if (isRevitExportRequest) {
               const [{ routeRevitExportApiRequest }, { ApsRevitExportBackend }] = await Promise.all([
@@ -170,6 +280,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeRevitExportApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse, revitExportBackend);
             } else if (isApsRevitImportRequest) {
@@ -181,6 +293,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeApsRevitImportApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse, apsRevitImportBackend);
             } else if (isAutoPlanRequest) {
@@ -188,6 +302,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeAutoPlanApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isSmartText2PlanRequest) {
@@ -195,6 +311,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeSmartText2PlanApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isText4jRequest) {
@@ -202,6 +320,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeText4jApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isText4hRequest) {
@@ -209,6 +329,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeText4hApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isText4gRequest) {
@@ -216,6 +338,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeText4gApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isText4fRequest) {
@@ -223,6 +347,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeText4fApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isText4eRequest) {
@@ -230,6 +356,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeText4eApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isText4dRequest) {
@@ -237,6 +365,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeText4dApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isText2PlanRequest) {
@@ -244,6 +374,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeText2PlanApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isAiRenderRequest) {
@@ -251,6 +383,8 @@ export default defineConfig(({ mode }) => {
               handled = await routeAiRenderApiRequest({
                 method: request.method,
                 url: request.url,
+                userId: apiUserId,
+                requestId,
                 body,
               }, apiResponse);
             } else if (isGeminiProxyRequest) {
@@ -270,10 +404,21 @@ export default defineConfig(({ mode }) => {
           } catch (error) {
             if (!response.writableEnded) {
               response.statusCode = 500;
+              finalStatus = 500;
               response.setHeader('Content-Type', 'application/json');
               response.end(JSON.stringify({
                 error: error instanceof Error ? error.message : String(error),
               }));
+            }
+          } finally {
+            // Nobody pays for work that errored out.
+            if (charged && apiUserId && finalStatus >= 400) {
+              await ledger.refundTokens(apiUserId, {
+                amount: charged.amount,
+                reason: charged.reason,
+                requestId,
+                detail: `${charged.detail} failed (${finalStatus}) — tokens returned.`,
+              }).catch(err => console.error('Token refund failed:', err));
             }
           }
         });

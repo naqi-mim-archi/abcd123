@@ -22,6 +22,12 @@ export interface ApsRevitImportConfig {
 }
 
 export interface ApsRevitImportJobRecord extends ApsRevitImportJobResponse {
+  /**
+   * Firebase uid of the caller who started the import. Job ids are unguessable, but that
+   * is not access control — the routes reject a mismatch. Null for jobs started while
+   * ALLOW_ANONYMOUS_API was on (local dev), which stay open.
+   */
+  ownerId?: string | null;
   createdAt: string;
   updatedAt: string;
   sourceFileName: string;
@@ -318,7 +324,7 @@ export class ApsRevitImportBackend {
     private readonly store: ApsRevitImportJobStore = new InMemoryApsRevitImportJobStore(),
   ) {}
 
-  async startImport(request: ApsRevitImportStartRequest): Promise<ApsRevitImportJobResponse> {
+  async startImport(request: ApsRevitImportStartRequest, ownerId: string | null = null): Promise<ApsRevitImportJobResponse> {
     validateStartRequest(request);
     const baseConfig = requireConfig(this.config);
     const options = { ...getDefaultApsRevitImportOptions(), ...(request.options || {}) };
@@ -328,6 +334,7 @@ export class ApsRevitImportBackend {
     const safeName = cleanFileName(request.fileName, 'source.rvt');
     const record: ApsRevitImportJobRecord = {
       jobId,
+      ownerId,
       status: 'queued',
       progressMessage: 'Preparing APS Revit Importer job...',
       warnings: [],
@@ -409,6 +416,12 @@ export class ApsRevitImportBackend {
       .filter(row => row.year > 0)
       .sort((a, b) => b.year - a.year);
     return { engines: rows };
+  }
+
+  /** Owner of a job, `undefined` when no such job exists. Used by the routes to gate reads. */
+  async getJobOwner(jobId: string): Promise<string | null | undefined> {
+    const record = await this.store.get(jobId);
+    return record ? record.ownerId ?? null : undefined;
   }
 
   async getStatus(jobId: string): Promise<ApsRevitImportJobResponse> {
